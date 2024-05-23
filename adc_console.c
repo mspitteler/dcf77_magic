@@ -21,7 +21,7 @@ static uint16_t *volatile sample_buf;
 
 static uint dma_chan;
 
-static void generate_biquad_IIR_bpf(int32_t *coeffs, double fs, double f_pass, double Q) {
+static void generate_biquad_IIR_bpf(int16_t *coeffs, double fs, double f_pass, double Q) {
     if (Q <= 0.0001)
         Q = 0.0001;
 
@@ -37,23 +37,20 @@ static void generate_biquad_IIR_bpf(int32_t *coeffs, double fs, double f_pass, d
     double a1 = -2. * c;
     double a2 = 1. - alpha;
 
-    coeffs[0] = b0 / a0 * 1073741824.; // 2.30 fixed point.
-    coeffs[1] = b1 / a0 * 1073741824.;
-    coeffs[2] = b2 / a0 * 1073741824.;
-    coeffs[3] = a1 / a0 * 1073741824.;
-    coeffs[4] = a2 / a0 * 1073741824.;
+    coeffs[0] = lround(b0 / a0 * 16384.); // 2.14 fixed point.
+    coeffs[1] = lround(b1 / a0 * 16384.);
+    coeffs[2] = lround(b2 / a0 * 16384.);
+    coeffs[3] = lround(a1 / a0 * 16384.);
+    coeffs[4] = lround(a2 / a0 * 16384.);
     
     printf("Biquad coefficients = { %lf, %lf, %lf, %lf, %lf }\n",
-           coeffs[0] / 1073741824., coeffs[1] / 1073741824., coeffs[2] / 1073741824.,
-           coeffs[3] / 1073741824., coeffs[4] / 1073741824.);
+           coeffs[0] / 16384., coeffs[1] / 16384., coeffs[2] / 16384., coeffs[3] / 16384., coeffs[4] / 16384.);
 }
 
-void filter_biquad_IIR_bpf(const int16_t *input, int32_t *output, int len, int32_t *coef, int32_t *w) {
+void filter_biquad_IIR_bpf(const int16_t *input, int32_t *output, int len, int16_t *coef, int32_t *w) {
     for (int i = 0; i < len; i++) {
-        int32_t d0 = ((int32_t)input[i] << 12) - (int32_t)(((int64_t)coef[3] * w[0]) >> 30) -
-            (int32_t)(((int64_t)coef[4] * w[1]) >> 30);
-        output[i] = (((int64_t)coef[0] * d0) >> 42) + (((int64_t)coef[1] * w[0]) >> 42) +
-            (((int64_t)coef[2] * w[1]) >> 42);
+        int32_t d0 = (int32_t)input[i] - ((coef[3] * w[0]) >> 14) - ((coef[4] * w[1]) >> 14);
+        output[i] = (coef[0] * d0 + coef[1] * w[0] + coef[2] * w[1]) >> 14;
         w[1] = w[0];
         w[0] = d0;
     }
@@ -80,7 +77,7 @@ void dma_handler() {
 }
 
 int main(void) {
-    int32_t bpf_coeffs[5];
+    int16_t bpf_coeffs[5];
     int32_t bpf_w[5] = { 0, 0 };
     
     stdio_init_all();
@@ -151,11 +148,11 @@ int main(void) {
             continue;
         filter_biquad_IIR_bpf((int16_t *)sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                               bpf_coeffs, bpf_w);
-        for (int i = 0; i < CAPTURE_DEPTH; ++i) {
-            printf("%1.5f, ", bpf_output_buf[i] * (3.3f / 4096.f));
-            if (i % 10 == 9)
-                printf("\n");
-        }
+        // for (int i = 0; i < CAPTURE_DEPTH; ++i) {
+        //     printf("%1.5f, ", bpf_output_buf[i] * (3.3f / 4096.f));
+        //     if (i % 10 == 9)
+        //         printf("\n");
+        // }
         printf("%llu\n", to_us_since_boot(get_absolute_time()) - to_us_since_boot(prev_time));
         prev_time = get_absolute_time();
         prev_sample_buf = sample_buf;
