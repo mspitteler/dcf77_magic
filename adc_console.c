@@ -87,7 +87,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(1000);
     
-    generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 100000.); // DCF77 frequency.
+    generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 10000.); // DCF77 frequency.
     
     // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
     adc_gpio_init(26 + CAPTURE_CHANNEL);
