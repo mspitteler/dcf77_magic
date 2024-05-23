@@ -12,76 +12,50 @@
 
 #define CAPTURE_DEPTH 16384
 
-#define ROUNDING_VALUE 0x7fffffffll
-
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
-static int16_t fir_output_buf[CAPTURE_DEPTH];
+static int32_t bpf_output_buf[CAPTURE_DEPTH];
 
 static uint16_t *volatile sample_buf;
 
 static uint dma_chan;
 
-static inline double __attribute__((always_inline)) sinc(double x) {
-    return x == 0. ? 1. : sin(M_PI * x) / (M_PI * x);
+static void generate_biquad_IIR_bpf(int32_t *coeffs, double fs, double f_pass, double Q) {
+    if (Q <= 0.0001)
+        Q = 0.0001;
+
+    double w0 = 2. * M_PI * f_pass / fs;
+    double c = cos(w0);
+    double s = sin(w0);
+    double alpha = s / (2. * Q);
+
+    double b0 = s / 2.;
+    double b1 = 0.;
+    double b2 = -b0;
+    double a0 = 1. + alpha;
+    double a1 = -2. * c;
+    double a2 = 1. - alpha;
+
+    coeffs[0] = b0 / a0 * 1073741824.; // 2.30 fixed point.
+    coeffs[1] = b1 / a0 * 1073741824.;
+    coeffs[2] = b2 / a0 * 1073741824.;
+    coeffs[3] = a1 / a0 * 1073741824.;
+    coeffs[4] = a2 / a0 * 1073741824.;
+    
+    printf("Biquad coefficients = { %lf, %lf, %lf, %lf, %lf }\n",
+           coeffs[0] / 1073741824., coeffs[1] / 1073741824., coeffs[2] / 1073741824.,
+           coeffs[3] / 1073741824., coeffs[4] / 1073741824.);
 }
 
-static double get_wind_blackman_coeff(const int i, const int len) {
-    const double a0 = 0.42;
-    const double a1 = 0.5;
-    const double a2 = 0.08;
-
-    double len_mult = 1. / (double)(len - 1);
-    return a0 - a1 * cos(i * 2. * M_PI * len_mult) + a2 * cos(i * 4. * M_PI * len_mult);
-}
-
-static void generate_FIR_coeffs(int32_t *fir_coeffs, const uint fir_len, const double fs, const double f_pass) {
-    // Even or odd length of the FIR filter
-    const bool is_odd = (fir_len % 2) ? true : false;
-    const double fir_order = (double)(fir_len - 1);
-    
-    const double w1 = 2. * (f_pass / fs - 1. / fir_len);
-    const double w2 = 2. * (f_pass / fs + 1. / fir_len);
-    
-    printf("Generating FIR coefficients");
-    
-    for (int i = 0; i < fir_len; i++) {
-        double t = (double)i - fir_len / 2.;
-        double coeff = w1 * sinc(w1 * t) - w2 * sinc(w2 * t);
-        coeff *= get_wind_blackman_coeff(i, fir_len);
-        fir_coeffs[i] = coeff * 2147483648.; // 1.31 fixed point.
-        
-        // printf("%e, ", fir_coeffs[i] / 2147483648.);
-        // if (i % 10 == 9)
-        //     printf("\n");
-        if (i % (fir_len / 10) == 0)
-            putchar('.');
-        fflush(stdout);
-    }
-    printf("\n");
-}
-
-void fixed_FIR_filter_s16_coeffs_1_31(const int32_t *const coeffs, const int coeffs_len, int16_t *const delay,
-                                      const int16_t *const input, int16_t *const output, const int len) {
-    static int pos = 0;
-    int result = 0;
-    int input_pos = 0;
-
+void filter_biquad_IIR_bpf(const int16_t *input, int32_t *output, int len, int32_t *coef, int32_t *w) {
     for (int i = 0; i < len; i++) {
-        if (pos >= coeffs_len)
-            pos = 0;
-        delay[pos++] = input[input_pos++];
-
-        int64_t acc = ROUNDING_VALUE;
-        int coeff_pos = coeffs_len - 1;
-
-        for (int n = pos; n < coeffs_len; n++)
-            acc += (int64_t)coeffs[coeff_pos--] * (int64_t)delay[n];
-        for (int n = 0; n < pos; n++)
-            acc += (int64_t)coeffs[coeff_pos--] * (int64_t)delay[n];
-
-        output[result++] = (int32_t)(acc >> 31);
+        int32_t d0 = ((int32_t)input[i] << 12) - (int32_t)(((int64_t)coef[3] * w[0]) >> 30) -
+            (int32_t)(((int64_t)coef[4] * w[1]) >> 30);
+        output[i] = (((int64_t)coef[0] * d0) >> 42) + (((int64_t)coef[1] * w[0]) >> 42) +
+            (((int64_t)coef[2] * w[1]) >> 42);
+        w[1] = w[0];
+        w[0] = d0;
     }
 }
 
@@ -106,15 +80,13 @@ void dma_handler() {
 }
 
 int main(void) {
-    const int fir_len = 4096;
-    int32_t fir_coeffs[fir_len];
-    int16_t fir_delay[fir_len];
+    int32_t bpf_coeffs[5];
+    int32_t bpf_w[5] = { 0, 0 };
     
     stdio_init_all();
     sleep_ms(1000);
     
-    generate_FIR_coeffs(fir_coeffs, fir_len, 0.5e6, 77.5e3); // DCF77 frequency.
-    memset(fir_delay, 0, sizeof(fir_delay) / sizeof(*fir_delay));
+    generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 100000.); // DCF77 frequency.
     
     // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
     adc_gpio_init(26 + CAPTURE_CHANNEL);
@@ -172,17 +144,20 @@ int main(void) {
     dma_handler();
 
     uint16_t *prev_sample_buf = sample_buf_pong;
+    absolute_time_t prev_time = get_absolute_time();
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
         if (sample_buf == NULL || sample_buf == prev_sample_buf)
             continue;
-        fixed_FIR_filter_s16_coeffs_1_31(fir_coeffs, fir_len, fir_delay, (int16_t *)sample_buf, fir_output_buf, 
-                                         CAPTURE_DEPTH);
+        filter_biquad_IIR_bpf((int16_t *)sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
+                              bpf_coeffs, bpf_w);
         for (int i = 0; i < CAPTURE_DEPTH; ++i) {
-            printf("%1.5f, ", fir_output_buf[i] * (3.3f / 4096.f));
+            printf("%1.5f, ", bpf_output_buf[i] * (3.3f / 4096.f));
             if (i % 10 == 9)
                 printf("\n");
         }
+        printf("%llu\n", to_us_since_boot(get_absolute_time()) - to_us_since_boot(prev_time));
+        prev_time = get_absolute_time();
         prev_sample_buf = sample_buf;
     }
     // Once DMA finishes, stop any new conversions from starting, and clean up
