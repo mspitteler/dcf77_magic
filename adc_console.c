@@ -2,6 +2,8 @@
 #include <assert.h>
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -148,12 +150,16 @@ int main(void) {
             continue;
         filter_biquad_IIR_bpf((int16_t *)sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                               bpf_coeffs, bpf_w);
-        // for (int i = 0; i < CAPTURE_DEPTH; ++i) {
-        //     printf("%1.5f, ", bpf_output_buf[i] * (3.3f / 4096.f));
-        //     if (i % 10 == 9)
-        //         printf("\n");
-        // }
-        printf("%llu\n", to_us_since_boot(get_absolute_time()) - to_us_since_boot(prev_time));
+        int64_t avg = 0ll;
+        for (int i = 0; i < CAPTURE_DEPTH; ++i) {
+            avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
+            // printf("%" PRIi32 "\n", bpf_output_buf[i]);
+            // if (i % 10 == 9)
+            //     printf("\n");
+        }
+        avg /= CAPTURE_DEPTH;
+        printf("%" PRIi32 "\n", (int32_t)avg);
+        // printf("%llu\n", to_us_since_boot(get_absolute_time()) - to_us_since_boot(prev_time));
         prev_time = get_absolute_time();
         prev_sample_buf = sample_buf;
     }
