@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <assert.h>
 #include <math.h>
 #include <string.h>
@@ -23,7 +24,7 @@ static uint16_t *volatile sample_buf;
 
 static uint dma_chan;
 
-static void generate_biquad_IIR_bpf(int16_t *coeffs, double fs, double f_pass, double Q) {
+static void generate_biquad_IIR_bpf(int16_t *const coeffs, const double fs, const double f_pass, double Q) {
     if (Q <= 0.0001)
         Q = 0.0001;
 
@@ -49,10 +50,11 @@ static void generate_biquad_IIR_bpf(int16_t *coeffs, double fs, double f_pass, d
            coeffs[0] / 16384., coeffs[1] / 16384., coeffs[2] / 16384., coeffs[3] / 16384., coeffs[4] / 16384.);
 }
 
-void filter_biquad_IIR_bpf(const int16_t *input, int32_t *output, int len, int16_t *coef, int32_t *w) {
+void filter_biquad_IIR_bpf(const int16_t *const input, int32_t *const output, const int len,
+                           const int16_t *const coeffs, int32_t *const w) {
     for (int i = 0; i < len; i++) {
-        int32_t d0 = (int32_t)input[i] - ((coef[3] * w[0]) >> 14) - ((coef[4] * w[1]) >> 14);
-        output[i] = (coef[0] * d0 + coef[1] * w[0] + coef[2] * w[1]) >> 14;
+        int32_t d0 = (int32_t)input[i] - ((coeffs[3] * w[0] + coeffs[4] * w[1]) >> 14);
+        output[i] = (coeffs[0] * d0 + coeffs[1] * w[0] + coeffs[2] * w[1]) >> 14;
         w[1] = w[0];
         w[0] = d0;
     }
@@ -148,19 +150,22 @@ int main(void) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
         if (sample_buf == NULL || sample_buf == prev_sample_buf)
             continue;
+        absolute_time_t processing_start_time = get_absolute_time();
         filter_biquad_IIR_bpf((int16_t *)sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                               bpf_coeffs, bpf_w);
         int64_t avg = 0ll;
-        for (int i = 0; i < CAPTURE_DEPTH; ++i) {
+        for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i) {
             avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
             // printf("%" PRIi32 "\n", bpf_output_buf[i]);
             // if (i % 10 == 9)
             //     printf("\n");
         }
-        avg /= CAPTURE_DEPTH;
+        avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
         printf("%" PRIi32 "\n", (int32_t)avg);
-        // printf("%llu\n", to_us_since_boot(get_absolute_time()) - to_us_since_boot(prev_time));
-        prev_time = get_absolute_time();
+        absolute_time_t processing_end_time = get_absolute_time();
+        // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
+        //        to_us_since_boot(processing_end_time) - to_us_since_boot(processing_start_time));
+        prev_time = processing_end_time;
         prev_sample_buf = sample_buf;
     }
     // Once DMA finishes, stop any new conversions from starting, and clean up
