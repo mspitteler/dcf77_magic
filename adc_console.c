@@ -146,6 +146,7 @@ int main(void) {
 
     uint16_t *prev_sample_buf = sample_buf_pong;
     absolute_time_t prev_time = get_absolute_time();
+    uint32_t adc_offset = 0u;
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
         if (sample_buf == NULL || sample_buf == prev_sample_buf)
@@ -153,14 +154,21 @@ int main(void) {
         absolute_time_t processing_start_time = get_absolute_time();
         filter_biquad_IIR_bpf((int16_t *)sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                               bpf_coeffs, bpf_w);
-        int64_t avg = 0ll;
+        int64_t avg = 0ll, full_spectrum_avg = 0ll;
         for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i) {
             avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
-            // printf("%" PRIi32 "\n", bpf_output_buf[i]);
+            // Weighted moving average, add 0.5 * 2048 - 1 to round.
+            adc_offset = ((adc_offset * 2047u) + ((uint32_t)sample_buf[i] << 9) + 1023u) >> 11;
+            int16_t *signed_sample_buf = (int16_t *volatile)sample_buf;
+            signed_sample_buf[i] -= ((adc_offset + 255u) >> 9); // Add 0.5 * 512 - 1 to round.
+            avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
+            full_spectrum_avg += signed_sample_buf[i] < 0 ? -signed_sample_buf[i] : signed_sample_buf[i];
+            // printf("%" PRIi16 "\n", sample_buf[i]);
             // if (i % 10 == 9)
             //     printf("\n");
         }
         avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+        // full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
         printf("%" PRIi32 "\n", (int32_t)avg);
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
