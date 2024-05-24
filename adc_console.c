@@ -155,24 +155,47 @@ int main(void) {
         int32_t full_spectrum_avg = 0;
         int16_t *signed_sample_buf = (int16_t *volatile)sample_buf;
         
+        /**
+         * Subtract ADC offset and calculate the average amplitude of the whole spectrum.
+         * We use mean of absolute values instead of RMS here because for that we would need to 
+         * multiply two 32-bit numbers, which would result in a 64-bit number, for this the 
+         * Cortex M0+ doesn't have hardware multiplication, so a single multiply would take
+         * 16 clock cycles, which is way to slow.
+         */
         for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i) {
-            // Weighted moving average, add 0.5 * 2048 - 1 to round.
+            // Exponential moving average, based on the formula s[t] = alpha * x[t] + (1 - alpha) * s[t - 1],
+            // where alpha is chosen as 1 / 2048 in this case. `sample_buf' is converted to 23.9 fixed point
+            // first. Before bitshifting right by 11, we add 0.5 * 2^11 - 1 to round.
             adc_offset = ((adc_offset * 2047u) + ((uint32_t)sample_buf[i] << 9) + 1023u) >> 11;
-            signed_sample_buf[i] -= ((adc_offset + 255u) >> 9); // Add 0.5 * 512 - 1 to round.
+            signed_sample_buf[i] -= ((adc_offset + 255u) >> 9); // Add 0.5 * 2^9 - 1 to round.
             full_spectrum_avg += signed_sample_buf[i] < 0 ? -signed_sample_buf[i] : signed_sample_buf[i];
             // printf("%" PRIi16 "\n", sample_buf[i]);
             // if (i % 10 == 9)
             //     printf("\n");
         }
+        // Should be very fast because the buffers are all powers of 2 in size, so we can just bitshift.
+        // full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
 
         filter_biquad_IIR_bpf(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                               bpf_coeffs, bpf_w);
         
+        /**
+         * Calculate average amplitude, we use mean of absolute values instead of RMS again.
+         */
         int64_t avg = 0ll;
         for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i)
             avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
         avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
-        // full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+        /**
+         * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
+         * estimate how close the DCF77 signal is to the noise floor.
+         */
+        
+        /**
+         * TODO: Make an average of `avg' over a very long amount of time so we can determine a good threshold
+         * for `high' and `low' levels, once we have this, we can time how long the low levels take to decode the
+         * DCF77 bits.
+         */
         printf("%" PRIi32 "\n", (int32_t)avg);
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
