@@ -201,7 +201,7 @@ int main(void) {
         
         avg_avg = ((avg_avg * 127u) + avg + 63u) >> 7;
         // 66% of the average seems to be a good threshold.
-        printf("%" PRIi32 ", %" PRIi32 "\n", avg, avg_avg * 2 / 3);
+        printf("%" PRIi32 ", %d\n", avg, avg > avg_avg * 2 / 3);
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
         //        to_us_since_boot(processing_end_time) - to_us_since_boot(processing_start_time));

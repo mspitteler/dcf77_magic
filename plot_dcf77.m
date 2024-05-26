@@ -2,7 +2,7 @@
 
 dcf77_tab = readtable('/tmp/dcf77.csv');
 dcf77 = table2array(dcf77_tab);
-dcf77_thresh = dcf77(:, 2);
+dcf77_bin = dcf77(:, 2) * 5000;
 dcf77 = dcf77(:, 1);
 
 fs = 0.5e6 / 16384;
@@ -12,9 +12,9 @@ figure();
 plot(0:1/length(dcf77_fft)*fs:fs-1/length(dcf77_fft), 20*log10(dcf77_fft));
 
 dcf77 = dcf77(end-(fs*10):end);
-dcf77_thresh = dcf77_thresh(end-(fs*10):end);
+dcf77_bin = dcf77_bin(end-(fs*10):end);
 figure();
 hold('on');
 plot(0:1/fs:(length(dcf77)-1)/fs, dcf77);
-plot(0:1/fs:(length(dcf77_thresh)-1)/fs, dcf77_thresh);
+plot(0:1/fs:(length(dcf77_bin)-1)/fs, dcf77_bin);
 hold('off');
