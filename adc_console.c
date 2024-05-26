@@ -150,6 +150,7 @@ int main(void) {
     uint16_t *prev_sample_buf = sample_buf_pong;
     absolute_time_t prev_time = get_absolute_time();
     uint32_t adc_offset = 0u;
+    int32_t avg_avg = 0;
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
         if (sample_buf == NULL || sample_buf == prev_sample_buf)
@@ -177,7 +178,7 @@ int main(void) {
             //     printf("\n");
         }
         // Should be very fast because the buffers are all powers of 2 in size, so we can just bitshift.
-        // full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+        full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
 
         filter_biquad_IIR(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                           bpf_coeffs, bpf_w);
@@ -198,12 +199,9 @@ int main(void) {
          * estimate how close the DCF77 signal is to the noise floor.
          */
         
-        /**
-         * TODO: Make an average of `avg' over a very long amount of time so we can determine a good threshold
-         * for `high' and `low' levels, once we have this, we can time how long the low levels take to decode the
-         * DCF77 bits.
-         */
-        printf("%" PRIi32 "\n", avg);
+        avg_avg = ((avg_avg * 127u) + avg + 63u) >> 7;
+        // 66% of the average seems to be a good threshold.
+        printf("%" PRIi32 ", %" PRIi32 "\n", avg, avg_avg * 2 / 3);
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
         //        to_us_since_boot(processing_end_time) - to_us_since_boot(processing_start_time));
