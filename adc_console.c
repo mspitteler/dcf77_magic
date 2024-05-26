@@ -18,7 +18,7 @@
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
-static int32_t bpf_output_buf[CAPTURE_DEPTH];
+static int16_t bpf_output_buf[CAPTURE_DEPTH];
 
 static uint16_t *volatile sample_buf;
 
@@ -50,10 +50,14 @@ static void generate_biquad_IIR_bpf(int16_t *const coeffs, const double fs, cons
            coeffs[0] / 16384., coeffs[1] / 16384., coeffs[2] / 16384., coeffs[3] / 16384., coeffs[4] / 16384.);
 }
 
-void filter_biquad_IIR_bpf(const int16_t *const input, int32_t *const output, const int len,
-                           const int16_t *const coeffs, int32_t *const w) {
+void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const int len,
+                       const int16_t *const coeffs, int32_t *const w) {
     for (int i = 0; i < len; i++) {
-        int32_t d0 = (int32_t)input[i] - ((coeffs[3] * w[0] + coeffs[4] * w[1]) >> 14);
+        // We have to use 64-bit multiplies here sadly, there is not really a way around it if we want high Q,
+        // but it's only two luckily, the other three coefficients can be multiplied with the coefficients downscaled
+        // by 5 bits, since they only affect the output amplitude, and not the behaviour of the filter internally.
+        int32_t d0 = ((int64_t)input[i] - (((int64_t)coeffs[3] * ((int64_t)w[0] << 5)
+            + (int64_t)coeffs[4] * ((int64_t)w[1] << 5)) >> 14)) >> 5;
         output[i] = (coeffs[0] * d0 + coeffs[1] * w[0] + coeffs[2] * w[1]) >> 14;
         w[1] = w[0];
         w[0] = d0;
@@ -87,7 +91,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(1000);
     
-    generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 10000.); // DCF77 frequency.
+    generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 15000.); // DCF77 frequency.
     
     // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
     adc_gpio_init(26 + CAPTURE_CHANNEL);
@@ -176,13 +180,17 @@ int main(void) {
         // Should be very fast because the buffers are all powers of 2 in size, so we can just bitshift.
         // full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
 
-        filter_biquad_IIR_bpf(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
-                              bpf_coeffs, bpf_w);
+        filter_biquad_IIR(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
+                          bpf_coeffs, bpf_w);
         
         /**
          * Calculate average amplitude, we use mean of absolute values instead of RMS again.
+         * You might say that we could also do this immediately in the filter, so that we don't
+         * need to store all the samples at the output of the buffer (which takes up 32KiB of RAM),
+         * but I tested it and it is not significantly slower to do it seperately, and we have enough
+         * RAM anyway, so it is more elegant to do it seperately I think.
          */
-        int64_t avg = 0ll;
+        int32_t avg = 0;
         for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i)
             avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
         avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
@@ -196,7 +204,7 @@ int main(void) {
          * for `high' and `low' levels, once we have this, we can time how long the low levels take to decode the
          * DCF77 bits.
          */
-        printf("%" PRIi32 "\n", (int32_t)avg);
+        printf("%" PRIi32 "\n", avg);
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
         //        to_us_since_boot(processing_end_time) - to_us_since_boot(processing_start_time));
