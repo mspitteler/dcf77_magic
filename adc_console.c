@@ -56,8 +56,7 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
         // We have to use 64-bit multiplies here sadly, there is not really a way around it if we want high Q,
         // but it's only two luckily, the other three coefficients can be multiplied with the coefficients downscaled
         // by 5 bits, since they only affect the output amplitude, and not the behaviour of the filter internally.
-        int32_t d0 = ((int64_t)input[i] - (((int64_t)coeffs[3] * ((int64_t)w[0] << 5)
-            + (int64_t)coeffs[4] * ((int64_t)w[1] << 5)) >> 14)) >> 5;
+        int32_t d0 = ((int64_t)input[i] - (((int64_t)coeffs[3] * w[0] + (int64_t)coeffs[4] * w[1]) >> (14 - 5))) >> 5;
         output[i] = (coeffs[0] * d0 + coeffs[1] * w[0] + coeffs[2] * w[1]) >> 14;
         w[1] = w[0];
         w[0] = d0;
