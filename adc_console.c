@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <assert.h>
 #include <math.h>
@@ -84,11 +85,16 @@ void dma_handler() {
     // Process what's in the read buffer.
 }
 
+void process_bit(uint64_t timestamp, bool bit_value) {
+    
+}
+
 void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
-    bool valid_bit = false;
+    enum { UNPROCESSED, PROCESSED, INVALID } bit_status = INVALID;
+    uint32_t prev_diff_mods[2] = { 0u, 0u };
     
-    while (true) {
+    for (int bit = 0;;) {
         uint64_t timestamp;
         ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
@@ -96,22 +102,51 @@ void core1_main(void) {
         
         if (!level) { // Going down.
             uint32_t diff_mod = (timestamp - prev_timestamp) % 1000000ull;
+            /**
+             * Is a valid bit if it is either:
+             * -    The 1st bit since boot.
+             * -    Approximately a whole number of seconds after the previous valid bit.
+             * -    Not a whole number of seconds after the previous valid bit, but the previous 2 invalid bits
+             *      have approximately the same modulo, which means that we at some point have missed a lot of bits,
+             *      or that we triggered to a dip caused by noise.
+             */
             if (is_at_the_end_of_time(from_us_since_boot(prev_timestamp)) ||
-                diff_mod < 50000u || 1000000u - diff_mod < 50000u) { // Shouldn't be off more than 50ms.
+                diff_mod < 50000u || 1000000u - diff_mod < 50000u || // Shouldn't be off more than 50ms.
+                (labs((int32_t)prev_diff_mods[0] - (int32_t)diff_mod) < 50000l &&
+                    labs((int32_t)prev_diff_mods[1] - (int32_t)diff_mod) < 50000l)) {
+                if (timestamp - prev_timestamp > 1950000ull && timestamp - prev_timestamp < 2050000ull &&
+                    bit_status != INVALID) {
+                    printf("%" PRIu32 ": Sync pulse!\n", us_to_ms(timestamp));
+                    bit = 0;
+                }
                 prev_timestamp = timestamp;
-                valid_bit = true;
+                bit_status = UNPROCESSED;
             }
-        } else if (valid_bit) { // Going up.
+            prev_diff_mods[1] = prev_diff_mods[0];
+            prev_diff_mods[0] = diff_mod;
+        } else if (bit_status == UNPROCESSED) { // Going up.
             uint32_t diff = timestamp - prev_timestamp;
-            if (diff > 300000u) // Too long, should be either 200ms or 100ms.
-                printf("Too long!!!: %llu\n", timestamp / 1000ull);
-            else if (diff > 150000ull)
-                printf("High: %llu\n", timestamp / 1000ull);
-            else if (diff > 50000ull)
-                printf("Low: %llu\n", timestamp / 1000ull);
-            else
-                printf("Too short!!!: %llu\n", timestamp / 1000ull);
-            valid_bit = false;
+            uint32_t prev_timestamp_ms = us_to_ms(prev_timestamp);
+            bool bit_value = false;
+            
+            if (diff > 300000u) { // Too long, should be either 200ms or 100ms.
+                printf("%" PRIu32 ": Too long!!!\n", prev_timestamp_ms);
+                bit_status = INVALID;
+            } else if (diff > 150000u) {
+                printf("%" PRIu32 ": Bit %d, high\n", prev_timestamp_ms, bit);
+                bit_value = true;
+                bit_status = PROCESSED;
+            } else {
+                printf("%" PRIu32 ": Bit %d, low\n", prev_timestamp_ms, bit);
+                bit_status = PROCESSED;
+            }
+            
+            if (bit_status == PROCESSED) {
+                process_bit(prev_timestamp, bit_value);
+            } else {
+                
+            }
+            bit++;
         }
     }
 }
@@ -236,8 +271,8 @@ int main(void) {
          */
         
         avg_avg = ((avg_avg * 127) + avg + 63) >> 7;
-        // 66% of the average seems to be a good threshold.
-        bool level = avg > avg_avg * 2 / 3;
+        // 75% of the average seems to be a good threshold.
+        bool level = avg > avg_avg * 3 / 4;
         absolute_time_t processing_end_time = get_absolute_time();
         if (level != prev_level) {
             uint64_t timestamp = to_us_since_boot(processing_start_time);
