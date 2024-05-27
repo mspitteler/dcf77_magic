@@ -354,39 +354,59 @@ int main(void) {
         filter_biquad_IIR(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                           bpf_coeffs, bpf_w);
         
-        /**
-         * Calculate average amplitude, we use mean of absolute values instead of RMS again.
-         * You might say that we could also do this immediately in the filter, so that we don't
-         * need to store all the samples at the output of the buffer (which takes up 32KiB of RAM),
-         * but I tested it and it is not significantly slower to do it seperately, and we have enough
-         * RAM anyway, so it is more elegant to do it seperately I think.
-         */
-        int32_t avg = 0;
-        for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i)
-            avg += bpf_output_buf[i] < 0 ? -bpf_output_buf[i] : bpf_output_buf[i];
-        avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
-        /**
-         * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
-         * estimate how close the DCF77 signal is to the noise floor.
-         */
-        
-        avg_avg = ((avg_avg * 127) + avg + 63) >> 7;
-        // 75% of the average seems to be a good threshold.
-        bool level = avg > avg_avg * 3 / 4;
-        absolute_time_t processing_end_time = get_absolute_time();
-        if (level != prev_level) {
-            uint64_t timestamp = to_us_since_boot(processing_start_time);
+        for (int i = 0; i < 4; i++) {
+            /**
+             * Calculate average amplitude, we use mean of absolute values instead of RMS again.
+             * You might say that we could also do this immediately in the filter, so that we don't
+             * need to store all the samples at the output of the buffer (which takes up 32KiB of RAM),
+             * but I tested it and it is not significantly slower to do it seperately, and we have enough
+             * RAM anyway, so it is more elegant to do it seperately I think.
+             */
+            static int32_t avgs[4] = { 0, 0, 0, 0 };
+            avgs[i] = 0;
+            for (int j = sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * i / 4;
+                 j < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (i + 1) / 4; ++j)
+                avgs[i] += bpf_output_buf[j] < 0 ? -bpf_output_buf[j] : bpf_output_buf[j];
+            int32_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+            /**
+             * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
+             * estimate how close the DCF77 signal is to the noise floor.
+             */
             
-            // Send to the other core to process.
-            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
-            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
-            multicore_fifo_push_blocking((uint32_t)level);
+            avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
+            // 75% of the average seems to be a good threshold.
+            bool level = avg > avg_avg * 3 / 4;
+            // printf("%" PRIi32 ", %d\n", avg, level);
+            if (level != prev_level) {
+                // This is not very elegant, but it is better than giving all 4 upsampled averages the same timestamp:
+                // We just choose the time in the middle of where we are taking the average. The round brackets are the
+                // previous buffer and the square brackets are the current buffer.
+                //                  _____|____ -16384
+                // i = 3:          |          |
+                //               _____|____ -24576
+                // i = 2:       |          |
+                //            _____|____ -32768
+                // i = 1:    |          |
+                //         _____|____ -40960
+                // i = 0: |          |
+                //     ( )( )( )( )[ ][ ][ ][ ]
+                //                            |
+                //                      proc_start_time
+                uint64_t timestamp = to_us_since_boot(processing_start_time) -
+                    // 1000000ull is the amount of microseconds in a second and 500000ull is the sample rate in Hz.
+                    1000000ull / 500000ull * sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (2 + 3 - i) / 4;
+                // Send to the other core to process.
+                multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
+                multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
+                multicore_fifo_push_blocking((uint32_t)level);
+            }
+            prev_level = level;
         }
+        absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
         //        to_us_since_boot(processing_end_time) - to_us_since_boot(processing_start_time));
         prev_time = processing_end_time;
         prev_sample_buf = sample_buf;
-        prev_level = level;
     }
     // Once DMA finishes, stop any new conversions from starting, and clean up
     // the FIFO in case the ADC was still mid-conversion.
