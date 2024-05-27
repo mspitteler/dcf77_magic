@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <limits.h>
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -85,8 +86,65 @@ void dma_handler() {
     // Process what's in the read buffer.
 }
 
-void process_bit(uint64_t timestamp, bool bit_value) {
-    
+void process_bit(uint64_t timestamp, int bit, bool bit_value) {
+    bool backup_antenna = false, announce_dst_switch = false, dst = false, announce_leap_second = false;
+    switch (bit) {
+        case 0:
+            if (bit_value != false)
+                printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
+            break;
+        case 1 ... 14:
+            // Meteorological data.
+            break;
+        case 15:
+            // Whether the backup antenna is in use.
+            backup_antenna = bit_value;
+            break;
+        case 16:
+            // Is 1 during the hour before switching.
+            announce_dst_switch = bit_value;
+        case 17 ... 18:
+            // DST or no DST.
+            break;
+        case 19:
+            // Is 1 during the hour before the leap second is inserted.
+            announce_leap_second = bit_value;
+            break;
+        case 20:
+            if (bit_value != true)
+                printf("%" PRIu32 ": Bit 20 should always be 1!!!\n", us_to_ms(timestamp));
+            break;
+        case 21 ... 27:
+            // Minutes.
+            break;
+        case 28:
+            // Bit 21 ... 27 even parity.
+            break;
+        case 29 ... 34:
+            // Hours.
+            break;
+        case 35:
+            // Bit 29 ... 34 even parity.
+            break;
+        case 36 ... 41:
+            // Day of month.
+            break;
+        case 42 ... 44:
+            // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
+            break;
+        case 45 ... 49:
+            // Month number.
+            break;
+        case 50 ... 57:
+            // Year.
+            break;
+        case 58:
+            // Bit 50 ... 57 even parity.
+            break;
+        case 59 ... INT_MAX:
+            // Invalid.
+            break;
+    }
 }
 
 void core1_main(void) {
@@ -142,7 +200,7 @@ void core1_main(void) {
             }
             
             if (bit_status == PROCESSED) {
-                process_bit(prev_timestamp, bit_value);
+                process_bit(prev_timestamp, bit, bit_value);
             } else {
                 
             }
