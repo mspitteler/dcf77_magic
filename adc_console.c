@@ -86,8 +86,13 @@ void dma_handler() {
     // Process what's in the read buffer.
 }
 
+static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
+
 void process_bit(uint64_t timestamp, int bit, bool bit_value) {
-    bool backup_antenna = false, announce_dst_switch = false, dst = false, announce_leap_second = false;
+    static bool backup_antenna = false, announce_dst_switch = false, dst = false, announce_leap_second = false;
+    static int minutes = -1, hours = -1, day_of_month = -1, day_of_week = -1, month_num = -1, year = -1;
+    
+    static bool parity = false;
     switch (bit) {
         case 0:
             if (bit_value != false)
@@ -116,30 +121,67 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
             break;
         case 21 ... 27:
             // Minutes.
+            if (bit == 21) {
+                minutes = 0;
+                parity = false;
+            }
+            minutes += (int)bit_value * bcd_table[bit - 21];
+            parity ^= bit_value;
             break;
         case 28:
             // Bit 21 ... 27 even parity.
+            if (bit_value != parity)
+                printf("%" PRIu32 ": Parity error in bits 21 ... 27\n", us_to_ms(timestamp));
             break;
         case 29 ... 34:
             // Hours.
+            if (bit == 29) {
+                hours = 0;
+                parity = false;
+            }
+            hours += (int)bit_value * bcd_table[bit - 29];
+            parity ^= bit_value;
             break;
         case 35:
             // Bit 29 ... 34 even parity.
+            if (bit_value != parity)
+                printf("%" PRIu32 ": Parity error in bits 29 ... 34\n", us_to_ms(timestamp));
             break;
         case 36 ... 41:
             // Day of month.
+            if (bit == 36) {
+                day_of_month = 0;
+                parity = false;
+            }
+            day_of_month += (int)bit_value * bcd_table[bit - 36];
+            parity ^= bit_value;
             break;
         case 42 ... 44:
             // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
+            if (bit == 42)
+                day_of_week = 0;
+            day_of_week += (int)bit_value * bcd_table[bit - 42];
+            parity ^= bit_value;
             break;
         case 45 ... 49:
             // Month number.
+            if (bit == 45)
+                month_num = 0;
+            month_num += (int)bit_value * bcd_table[bit - 45];
+            parity ^= bit_value;
             break;
         case 50 ... 57:
+            if (bit == 50)
+                year = 0;
+            year += (int)bit_value * bcd_table[bit - 50];
+            parity ^= bit_value;
             // Year.
             break;
         case 58:
-            // Bit 50 ... 57 even parity.
+            // Bit 36 ... 57 even parity.
+            if (bit_value != parity)
+                printf("%" PRIu32 ": Parity error in bits 36 ... 57\n", us_to_ms(timestamp));
+            printf("%02d:%02d, %d, %02d-%02d-%02d\n", hours, minutes, day_of_week, day_of_month, month_num, year); 
             break;
         case 59 ... INT_MAX:
             // Invalid.
@@ -191,11 +233,11 @@ void core1_main(void) {
                 printf("%" PRIu32 ": Too long!!!\n", prev_timestamp_ms);
                 bit_status = INVALID;
             } else if (diff > 150000u) {
-                printf("%" PRIu32 ": Bit %d, high\n", prev_timestamp_ms, bit);
+                // printf("%" PRIu32 ": Bit %d, high\n", prev_timestamp_ms, bit);
                 bit_value = true;
                 bit_status = PROCESSED;
             } else {
-                printf("%" PRIu32 ": Bit %d, low\n", prev_timestamp_ms, bit);
+                // printf("%" PRIu32 ": Bit %d, low\n", prev_timestamp_ms, bit);
                 bit_status = PROCESSED;
             }
             
