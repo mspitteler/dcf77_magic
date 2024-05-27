@@ -10,6 +10,7 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "pico/multicore.h"
 
 #define CAPTURE_CHANNEL 0
 
@@ -83,12 +84,46 @@ void dma_handler() {
     // Process what's in the read buffer.
 }
 
+void core1_main(void) {
+    uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
+    bool valid_bit = false;
+    
+    while (true) {
+        uint64_t timestamp;
+        ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
+        ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
+        bool level = (bool)multicore_fifo_pop_blocking();
+        
+        if (!level) { // Going down.
+            uint32_t diff_mod = (timestamp - prev_timestamp) % 1000000ull;
+            if (is_at_the_end_of_time(from_us_since_boot(prev_timestamp)) ||
+                diff_mod < 50000u || 1000000u - diff_mod < 50000u) { // Shouldn't be off more than 50ms.
+                prev_timestamp = timestamp;
+                valid_bit = true;
+            }
+        } else if (valid_bit) { // Going up.
+            uint32_t diff = timestamp - prev_timestamp;
+            if (diff > 300000u) // Too long, should be either 200ms or 100ms.
+                printf("Too long!!!: %llu\n", timestamp / 1000ull);
+            else if (diff > 150000ull)
+                printf("High: %llu\n", timestamp / 1000ull);
+            else if (diff > 50000ull)
+                printf("Low: %llu\n", timestamp / 1000ull);
+            else
+                printf("Too short!!!: %llu\n", timestamp / 1000ull);
+            valid_bit = false;
+        }
+    }
+}
+
 int main(void) {
     int16_t bpf_coeffs[5];
     int32_t bpf_w[5] = { 0, 0 };
     
     stdio_init_all();
     sleep_ms(1000);
+    
+    multicore_launch_core1(&core1_main);
     
     generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 15000.); // DCF77 frequency.
     
@@ -151,6 +186,7 @@ int main(void) {
     absolute_time_t prev_time = get_absolute_time();
     uint32_t adc_offset = 0u;
     int32_t avg_avg = 0;
+    bool prev_level = false;
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
         if (sample_buf == NULL || sample_buf == prev_sample_buf)
@@ -199,14 +235,23 @@ int main(void) {
          * estimate how close the DCF77 signal is to the noise floor.
          */
         
-        avg_avg = ((avg_avg * 127u) + avg + 63u) >> 7;
+        avg_avg = ((avg_avg * 127) + avg + 63) >> 7;
         // 66% of the average seems to be a good threshold.
-        printf("%" PRIi32 ", %d\n", avg, avg > avg_avg * 2 / 3);
+        bool level = avg > avg_avg * 2 / 3;
         absolute_time_t processing_end_time = get_absolute_time();
+        if (level != prev_level) {
+            uint64_t timestamp = to_us_since_boot(processing_start_time);
+            
+            // Send to the other core to process.
+            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
+            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
+            multicore_fifo_push_blocking((uint32_t)level);
+        }
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
         //        to_us_since_boot(processing_end_time) - to_us_since_boot(processing_start_time));
         prev_time = processing_end_time;
         prev_sample_buf = sample_buf;
+        prev_level = level;
     }
     // Once DMA finishes, stop any new conversions from starting, and clean up
     // the FIFO in case the ADC was still mid-conversion.
