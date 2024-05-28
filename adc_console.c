@@ -18,11 +18,13 @@
 #define CAPTURE_CHANNEL 0
 
 #define CAPTURE_DEPTH 20000
+#define MATCHED_FILTER_N_SECONDS 100
 
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
+static int32_t avg_buf[500000 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS];
 
 static uint16_t *volatile sample_buf;
 
@@ -76,7 +78,7 @@ void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t 
     int lsig = sig_len;
     int lkern = kern_len;
     
-    memset(conv_out, 0, (sig_len + kern_len - 1) * sizeof(*conv_out));
+    memset(conv_out, 0, kern_len * sizeof(*conv_out));
 
     if (sig_len < kern_len) {
         sig = kernel;
@@ -89,7 +91,7 @@ void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t 
         size_t k;
 
         for (k = 0; k <= n; k++)
-            conv_out[n] += sig[k] * kern[n - k];
+            conv_out[n % kern_len] += sig[k] * kern[n - k];
     }
     for (int n = lkern; n < lsig; n++) {
         size_t kmin, kmax, k;
@@ -97,7 +99,7 @@ void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t 
         kmin = n - lkern + 1;
         kmax = n;
         for (k = kmin; k <= kmax; k++)
-            conv_out[n] += sig[k] * kern[n - k];
+            conv_out[n % kern_len] += sig[k] * kern[n - k];
     }
 
     for (int n = lsig; n < lsig + lkern - 1; n++) {
@@ -107,7 +109,7 @@ void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t 
         kmax =  lsig - 1;
 
         for (k = kmin; k <= kmax; k++)
-            conv_out[n] += sig[k] * kern[n - k];
+            conv_out[n % kern_len] += sig[k] * kern[n - k];
     }
 }
 
