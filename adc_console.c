@@ -18,7 +18,7 @@
 #define CAPTURE_CHANNEL 0
 
 #define CAPTURE_DEPTH 20000
-#define MATCHED_FILTER_N_SECONDS 100
+#define MATCHED_FILTER_N_SECONDS 150
 
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
@@ -89,27 +89,36 @@ void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t 
 
     for (int n = 0; n < lkern; n++) {
         size_t k;
+        
+        int n_mod_kern_len = n % kern_len;
 
         for (k = 0; k <= n; k++)
-            conv_out[n % kern_len] += sig[k] * kern[n - k];
+            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
     }
     for (int n = lkern; n < lsig; n++) {
         size_t kmin, kmax, k;
+        
+        hw_divider_divmod_s32_start(n, kern_len);
 
         kmin = n - lkern + 1;
         kmax = n;
+        
+        int n_mod_kern_len = hw_divider_s32_remainder_wait();
         for (k = kmin; k <= kmax; k++)
-            conv_out[n % kern_len] += sig[k] * kern[n - k];
+            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
     }
 
     for (int n = lsig; n < lsig + lkern - 1; n++) {
         size_t kmin, kmax, k;
+        
+        hw_divider_divmod_s32_start(n, kern_len);
 
         kmin = n - lkern + 1;
         kmax =  lsig - 1;
 
+        int n_mod_kern_len = hw_divider_s32_remainder_wait();
         for (k = kmin; k <= kmax; k++)
-            conv_out[n % kern_len] += sig[k] * kern[n - k];
+            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
     }
 }
 
@@ -264,6 +273,8 @@ void core1_main(void) {
     uint32_t prev_diff_mods[2] = { 0u, 0u };
     int32_t avg_avg = 0;
     bool prev_level = false;
+    int avg_buf_idx = 0;
+    static int32_t conv_out[sizeof(kernel) / sizeof(*kernel)];
     
     for (int bit = 0;;) {
         uint64_t timestamp;
@@ -271,6 +282,17 @@ void core1_main(void) {
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
         int32_t avg = (int32_t)multicore_fifo_pop_blocking();
         
+        avg_buf[avg_buf_idx++] = avg;
+        if (avg_buf_idx == sizeof(avg_buf) / sizeof(*avg_buf)) {
+            absolute_time_t tic = get_absolute_time();
+            conv_wrapped(avg_buf, avg_buf_idx, kernel, sizeof(kernel) / sizeof(*kernel), conv_out);
+            absolute_time_t toc = get_absolute_time();
+            for (int i = 0; i < 100; i++)
+                printf("%d\n", conv_out[i]);
+            printf("time = %llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
+            abort();
+        }
+#if 0
         avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
         // 75% of the average seems to be a good threshold.
         bool level = avg > avg_avg * 3 / 4;
@@ -329,6 +351,7 @@ void core1_main(void) {
             }
             bit++;
         }
+#endif
     }
 }
 
@@ -456,7 +479,7 @@ int main(void) {
              * estimate how close the DCF77 signal is to the noise floor.
              */
             
-            printf("%" PRIi32 "\n", avg);
+            // printf("%" PRIi32 "\n", avg);
             // This is not very elegant, but it is better than giving all 4 upsampled averages the same timestamp:
             // We just choose the time in the middle of where we are taking the average. The round brackets are the
             // previous buffer and the square brackets are the current buffer.
