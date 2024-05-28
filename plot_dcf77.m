@@ -5,7 +5,7 @@ dcf77 = table2array(dcf77_tab(:, 1:2));
 dcf77_bin = dcf77(:, 2) * 5000;
 dcf77 = dcf77(:, 1);
 
-fs = 0.5e6 / 4096;
+fs = 0.5e6 / 5000;
 
 dcf77_fft = abs(fft((dcf77 - mean(dcf77))/4096));
 figure();

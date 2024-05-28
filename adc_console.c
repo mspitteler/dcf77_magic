@@ -12,11 +12,12 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "hardware/divider.h"
 #include "pico/multicore.h"
 
 #define CAPTURE_CHANNEL 0
 
-#define CAPTURE_DEPTH 16384
+#define CAPTURE_DEPTH 20000
 
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
@@ -348,12 +349,14 @@ int main(void) {
             // if (i % 10 == 9)
             //     printf("\n");
         }
-        // Should be very fast because the buffers are all powers of 2 in size, so we can just bitshift.
-        full_spectrum_avg /= (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+        hw_divider_divmod_s32_start(full_spectrum_avg, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
 
         filter_biquad_IIR(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                           bpf_coeffs, bpf_w);
         
+        // The division of the full spectrum average should be done by now.
+        full_spectrum_avg = hw_divider_s32_quotient_wait();
+
         for (int i = 0; i < 4; i++) {
             /**
              * Calculate average amplitude, we use mean of absolute values instead of RMS again.
@@ -381,13 +384,13 @@ int main(void) {
                 // This is not very elegant, but it is better than giving all 4 upsampled averages the same timestamp:
                 // We just choose the time in the middle of where we are taking the average. The round brackets are the
                 // previous buffer and the square brackets are the current buffer.
-                //                  _____|____ -16384
+                //                  _____|____ -20000us
                 // i = 3:          |          |
-                //               _____|____ -24576
+                //               _____|____ -30000us
                 // i = 2:       |          |
-                //            _____|____ -32768
+                //            _____|____ -40000us
                 // i = 1:    |          |
-                //         _____|____ -40960
+                //         _____|____ -50000us
                 // i = 0: |          |
                 //     ( )( )( )( )[ ][ ][ ][ ]
                 //                            |
