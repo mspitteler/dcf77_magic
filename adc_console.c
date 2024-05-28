@@ -67,6 +67,50 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
     }
 }
 
+// `conv_out' will be wrapped to have the same length as the kernel.
+void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t *const kernel, const int kern_len,
+                  int32_t *const conv_out) {
+
+    const int32_t *sig = signal;
+    const int32_t *kern = kernel;
+    int lsig = sig_len;
+    int lkern = kern_len;
+    
+    memset(conv_out, 0, (sig_len + kern_len - 1) * sizeof(*conv_out));
+
+    if (sig_len < kern_len) {
+        sig = kernel;
+        kern = signal;
+        lsig = kern_len;
+        lkern = sig_len;
+    }
+
+    for (int n = 0; n < lkern; n++) {
+        size_t k;
+
+        for (k = 0; k <= n; k++)
+            conv_out[n] += sig[k] * kern[n - k];
+    }
+    for (int n = lkern; n < lsig; n++) {
+        size_t kmin, kmax, k;
+
+        kmin = n - lkern + 1;
+        kmax = n;
+        for (k = kmin; k <= kmax; k++)
+            conv_out[n] += sig[k] * kern[n - k];
+    }
+
+    for (int n = lsig; n < lsig + lkern - 1; n++) {
+        size_t kmin, kmax, k;
+
+        kmin = n - lkern + 1;
+        kmax =  lsig - 1;
+
+        for (k = kmin; k <= kmax; k++)
+            conv_out[n] += sig[k] * kern[n - k];
+    }
+}
+
 void dma_handler() {
     static bool write_ping = true;
     // Clear the interrupt request.
@@ -202,7 +246,7 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
 //                     |  |
 //     0 -             '--'
 //
-static const int8_t kernel[] = {
+static const int32_t kernel[] = {
     [0 ... (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.4 - 1.)] = 7,
     [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.4) ...
         (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.5 - 1.)] = 3,
