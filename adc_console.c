@@ -194,12 +194,24 @@ void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
     enum { UNPROCESSED, PROCESSED, INVALID } bit_status = INVALID;
     uint32_t prev_diff_mods[2] = { 0u, 0u };
+    int32_t avg_avg = 0;
+    bool prev_level = false;
     
     for (int bit = 0;;) {
         uint64_t timestamp;
         ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
-        bool level = (bool)multicore_fifo_pop_blocking();
+        int32_t avg = (int32_t)multicore_fifo_pop_blocking();
+        
+        avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
+        // 75% of the average seems to be a good threshold.
+        bool level = avg > avg_avg * 3 / 4;
+        
+        if (level == prev_level) {
+            prev_level = level;
+            continue;
+        }
+        prev_level = level;
         
         if (!level) { // Going down.
             uint32_t diff_mod = (timestamp - prev_timestamp) % 1000000ull;
@@ -217,7 +229,7 @@ void core1_main(void) {
                     labs((int32_t)prev_diff_mods[1] - (int32_t)diff_mod) < 50000l)) {
                 if (timestamp - prev_timestamp > 1950000ull && timestamp - prev_timestamp < 2050000ull &&
                     bit_status != INVALID) {
-                    printf("%" PRIu32 ": Sync pulse!\n", us_to_ms(timestamp));
+                    // printf("%" PRIu32 ": Sync pulse!\n", us_to_ms(timestamp));
                     bit = 0;
                 }
                 prev_timestamp = timestamp;
@@ -231,7 +243,7 @@ void core1_main(void) {
             bool bit_value = false;
             
             if (diff > 300000u) { // Too long, should be either 200ms or 100ms.
-                printf("%" PRIu32 ": Too long!!!\n", prev_timestamp_ms);
+                // printf("%" PRIu32 ": Too long!!!\n", prev_timestamp_ms);
                 bit_status = INVALID;
             } else if (diff > 150000u) {
                 // printf("%" PRIu32 ": Bit %d, high\n", prev_timestamp_ms, bit);
@@ -243,7 +255,7 @@ void core1_main(void) {
             }
             
             if (bit_status == PROCESSED) {
-                process_bit(prev_timestamp, bit, bit_value);
+                // process_bit(prev_timestamp, bit, bit_value);
             } else {
                 
             }
@@ -321,8 +333,6 @@ int main(void) {
     uint16_t *prev_sample_buf = sample_buf_pong;
     absolute_time_t prev_time = get_absolute_time();
     uint32_t adc_offset = 0u;
-    int32_t avg_avg = 0;
-    bool prev_level = false;
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
         if (sample_buf == NULL || sample_buf == prev_sample_buf)
@@ -354,7 +364,7 @@ int main(void) {
         filter_biquad_IIR(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
                           bpf_coeffs, bpf_w);
         
-        // The division of the full spectrum average should be done by now.
+        // The division of the full spectrum average should be done by now (takes 8 clockcycles).
         full_spectrum_avg = hw_divider_s32_quotient_wait();
 
         for (int i = 0; i < 4; i++) {
@@ -370,40 +380,36 @@ int main(void) {
             for (int j = sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * i / 4;
                  j < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (i + 1) / 4; ++j)
                 avgs[i] += bpf_output_buf[j] < 0 ? -bpf_output_buf[j] : bpf_output_buf[j];
+            // We're not dividing by a power of 2 anymore here, but apparently the / operator is using the
+            // hardware divider anyway, so it will only take 8 cycles.
             int32_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
             /**
              * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
              * estimate how close the DCF77 signal is to the noise floor.
              */
             
-            avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
-            // 75% of the average seems to be a good threshold.
-            bool level = avg > avg_avg * 3 / 4;
-            // printf("%" PRIi32 ", %d\n", avg, level);
-            if (level != prev_level) {
-                // This is not very elegant, but it is better than giving all 4 upsampled averages the same timestamp:
-                // We just choose the time in the middle of where we are taking the average. The round brackets are the
-                // previous buffer and the square brackets are the current buffer.
-                //                  _____|____ -20000us
-                // i = 3:          |          |
-                //               _____|____ -30000us
-                // i = 2:       |          |
-                //            _____|____ -40000us
-                // i = 1:    |          |
-                //         _____|____ -50000us
-                // i = 0: |          |
-                //     ( )( )( )( )[ ][ ][ ][ ]
-                //                            |
-                //                      proc_start_time
-                uint64_t timestamp = to_us_since_boot(processing_start_time) -
-                    // 1000000ull is the amount of microseconds in a second and 500000ull is the sample rate in Hz.
-                    1000000ull / 500000ull * sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (2 + 3 - i) / 4;
-                // Send to the other core to process.
-                multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
-                multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
-                multicore_fifo_push_blocking((uint32_t)level);
-            }
-            prev_level = level;
+            printf("%" PRIi32 "\n", avg);
+            // This is not very elegant, but it is better than giving all 4 upsampled averages the same timestamp:
+            // We just choose the time in the middle of where we are taking the average. The round brackets are the
+            // previous buffer and the square brackets are the current buffer.
+            //                  _____|____ -20000us
+            // i = 3:          |          |
+            //               _____|____ -30000us
+            // i = 2:       |          |
+            //            _____|____ -40000us
+            // i = 1:    |          |
+            //         _____|____ -50000us
+            // i = 0: |          |
+            //     ( )( )( )( )[ ][ ][ ][ ]
+            //                            |
+            //                      proc_start_time
+            uint64_t timestamp = to_us_since_boot(processing_start_time) -
+                // 1000000ull is the amount of microseconds in a second and 500000ull is the sample rate in Hz.
+                1000000ull / 500000ull * sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (2 + 3 - i) / 4;
+            // Send to the other core to process.
+            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
+            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
+            multicore_fifo_push_blocking((uint32_t)avg);
         }
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
