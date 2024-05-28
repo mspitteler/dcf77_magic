@@ -190,6 +190,28 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
     }
 }
 
+// Kernel is the time inverted expected signal (1 period is 1s):
+//
+//     1 -  ________       ________
+//                  |     |
+//  0.75 -          |     |
+//                  |     |
+//   0.5 -          |__   |
+//              0.43 ^ |  |
+//  0.25 -             |  |
+//                     |  |
+//     0 -             '--'
+//
+static const int8_t kernel[] = {
+    [0 ... (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.4 - 1.)] = 7,
+    [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.4) ...
+        (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.5 - 1.)] = 3,
+    [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.5) ...
+        (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.6 - 1.)] = 0,
+    [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.6) ...
+        (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 1. - 1.)] = 7,
+};
+
 void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
     enum { UNPROCESSED, PROCESSED, INVALID } bit_status = INVALID;
