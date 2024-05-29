@@ -24,7 +24,11 @@
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
-static int32_t avg_buf[500000 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS];
+static int32_t conv_buf[500000 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
+    // Initialize all elements to -1, they should normally never have a negative value, so this is to detect 
+    // which elements haven't been set yet.
+    [0 ... sizeof(conv_buf) / sizeof(*conv_buf) - 1] = -1
+};
 
 static uint16_t *volatile sample_buf;
 
@@ -69,57 +73,23 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
     }
 }
 
-// `conv_out' will be wrapped to have the same length as the kernel.
-void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t *const kernel, const int kern_len,
-                  int32_t *const conv_out) {
-
-    const int32_t *sig = signal;
-    const int32_t *kern = kernel;
-    int lsig = sig_len;
-    int lkern = kern_len;
+// Essentially just a FIR filter.
+int32_t conv_continuous(const int32_t val, const int32_t *const kernel, const int kern_len,
+                        int32_t *const delay) {
+    static int pos = 0;
+    int32_t acc = 0;
+    int kern_pos = kern_len - 1;
     
-    memset(conv_out, 0, kern_len * sizeof(*conv_out));
-
-    if (sig_len < kern_len) {
-        sig = kernel;
-        kern = signal;
-        lsig = kern_len;
-        lkern = sig_len;
-    }
-
-    for (int n = 0; n < lkern; n++) {
-        size_t k;
-        
-        int n_mod_kern_len = n % kern_len;
-
-        for (k = 0; k <= n; k++)
-            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
-    }
-    for (int n = lkern; n < lsig; n++) {
-        size_t kmin, kmax, k;
-        
-        hw_divider_divmod_s32_start(n, kern_len);
-
-        kmin = n - lkern + 1;
-        kmax = n;
-        
-        int n_mod_kern_len = hw_divider_s32_remainder_wait();
-        for (k = kmin; k <= kmax; k++)
-            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
-    }
-
-    for (int n = lsig; n < lsig + lkern - 1; n++) {
-        size_t kmin, kmax, k;
-        
-        hw_divider_divmod_s32_start(n, kern_len);
-
-        kmin = n - lkern + 1;
-        kmax =  lsig - 1;
-
-        int n_mod_kern_len = hw_divider_s32_remainder_wait();
-        for (k = kmin; k <= kmax; k++)
-            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
-    }
+    delay[pos] = val;
+    pos++;
+    if (pos >= kern_len)
+        pos = 0;
+    
+    for (int n = pos; n < kern_len; n++)
+        acc += kernel[kern_pos--] * delay[n];
+    for (int n = 0; n < pos ; n++)
+        acc += kernel[kern_pos--] * delay[n];
+    return acc;
 }
 
 void dma_handler() {
@@ -273,8 +243,11 @@ void core1_main(void) {
     uint32_t prev_diff_mods[2] = { 0u, 0u };
     int32_t avg_avg = 0;
     bool prev_level = false;
-    int avg_buf_idx = 0;
-    static int32_t conv_out[sizeof(kernel) / sizeof(*kernel)];
+    
+    // Making it static because then all elements automatically get initialized to 0,
+    // and such large arrays on the stack isn't very pretty.
+    static int32_t delay[sizeof(kernel) / sizeof(*kernel)];
+    int conv_buf_idx = 0;
     
     for (int bit = 0;;) {
         uint64_t timestamp;
@@ -282,15 +255,35 @@ void core1_main(void) {
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
         int32_t avg = (int32_t)multicore_fifo_pop_blocking();
         
-        avg_buf[avg_buf_idx++] = avg;
-        if (avg_buf_idx == sizeof(avg_buf) / sizeof(*avg_buf)) {
-            absolute_time_t tic = get_absolute_time();
-            conv_wrapped(avg_buf, avg_buf_idx, kernel, sizeof(kernel) / sizeof(*kernel), conv_out);
-            absolute_time_t toc = get_absolute_time();
-            for (int i = 0; i < 100; i++)
-                printf("%d\n", conv_out[i]);
-            printf("time = %llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
-            abort();
+        conv_buf[conv_buf_idx++] = conv_continuous(avg, kernel, sizeof(kernel) / sizeof(*kernel), delay);
+        if (conv_buf_idx >= sizeof(conv_buf) / sizeof(*conv_buf))
+            conv_buf_idx = 0;
+        
+        int32_t wrapped_conv_buf[sizeof(kernel) / sizeof(*kernel)] = { 0 }; 
+        if (conv_buf_idx % (sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf)) == 0) {
+            // Check if last sample has been written.
+            bool filled = conv_buf[sizeof(conv_buf) / sizeof(*conv_buf) - 1] != -1;
+            // Skip the first 100 samples if the averages haven't propagated through the entire delay line yet, so
+            // that we don't get any startup behaviour in our wrapped buffer.
+            int imin = filled ? 0 : (sizeof(kernel) / sizeof(*kernel));
+            // Must be a multiple of 1s (100 samples) always.
+            int imax = filled ? (sizeof(conv_buf) / sizeof(*conv_buf)) : conv_buf_idx;
+
+            for (int i = imin; i < imax; i++)
+                wrapped_conv_buf[i % (sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf))] += conv_buf[i];
+            // if (conv_buf_idx == 10000)
+            //     for (int i = 0; i < (sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf)); i++) {
+            //         printf("%" PRIi32 "\n", wrapped_conv_buf[i]);
+            //     }
+            int32_t max = 0;
+            int max_idx = 0;
+            for (int i = 0; i < sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf); i++) {
+                if (wrapped_conv_buf[i] > max) {
+                    max_idx = i;
+                    max = wrapped_conv_buf[i];
+                }
+            }
+            printf("%d\n", max_idx);
         }
 #if 0
         avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
