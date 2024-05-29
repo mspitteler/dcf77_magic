@@ -20,14 +20,16 @@
 #define CAPTURE_DEPTH 20000
 #define MATCHED_FILTER_N_SECONDS 150
 
+#define N_ELEM(a) (sizeof(a) / sizeof(*(a)))
+
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
-static int32_t conv_buf[500000 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
+static int32_t conv_buf[500000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
     // Initialize all elements to -1, they should normally never have a negative value, so this is to detect 
     // which elements haven't been set yet.
-    [0 ... sizeof(conv_buf) / sizeof(*conv_buf) - 1] = -1
+    [0 ... N_ELEM(conv_buf) - 1] = -1
 };
 
 static uint16_t *volatile sample_buf;
@@ -228,26 +230,23 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
 //     0 -             '--'
 //
 static const int32_t kernel[] = {
-    [0 ... (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.4 - 1.)] = 7,
-    [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.4) ...
-        (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.5 - 1.)] = 3,
-    [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.5) ...
-        (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.6 - 1.)] = 0,
-    [(int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 0.6) ...
-        (int)(0.5e6 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4.) * 1. - 1.)] = 7,
+    [0 ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.4) - 1] = 7,
+    [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.4) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.5) - 1] = 3,
+    [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.5) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.6) - 1] = 0,
+    [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.6) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 1.) - 1] = 7,
 };
 
 void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
     enum { UNPROCESSED, PROCESSED, INVALID } bit_status = INVALID;
     uint32_t prev_diff_mods[2] = { 0u, 0u };
-    int32_t avg_avg = 0;
+    int32_t avg_sum = 0, avg_avg = 0, prev_avg_avgs[2] = { 0, 0 };
     bool prev_level = false;
     
     // Making it static because then all elements automatically get initialized to 0,
     // and such large arrays on the stack isn't very pretty.
-    static int32_t delay[sizeof(kernel) / sizeof(*kernel)];
-    int conv_buf_idx = 0;
+    static int32_t delay[N_ELEM(kernel)];
+    int conv_buf_idx = 0, max_idx = 0;
     
     for (int bit = 0;;) {
         uint64_t timestamp;
@@ -255,47 +254,64 @@ void core1_main(void) {
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
         int32_t avg = (int32_t)multicore_fifo_pop_blocking();
         
-        conv_buf[conv_buf_idx++] = conv_continuous(avg, kernel, sizeof(kernel) / sizeof(*kernel), delay);
-        if (conv_buf_idx >= sizeof(conv_buf) / sizeof(*conv_buf))
+        absolute_time_t tic = get_absolute_time();
+        conv_buf[conv_buf_idx++] = conv_continuous(avg, kernel, N_ELEM(kernel), delay);
+        if (conv_buf_idx >= N_ELEM(conv_buf))
             conv_buf_idx = 0;
         
-        int32_t wrapped_conv_buf[sizeof(kernel) / sizeof(*kernel)] = { 0 }; 
-        if (conv_buf_idx % (sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf)) == 0) {
+        int32_t wrapped_conv_buf[N_ELEM(kernel)] = { 0 }; 
+        if (conv_buf_idx % N_ELEM(wrapped_conv_buf) == 0) {
             // Check if last sample has been written.
-            bool filled = conv_buf[sizeof(conv_buf) / sizeof(*conv_buf) - 1] != -1;
+            bool filled = conv_buf[N_ELEM(conv_buf) - 1] != -1;
             // Skip the first 100 samples if the averages haven't propagated through the entire delay line yet, so
             // that we don't get any startup behaviour in our wrapped buffer.
-            int imin = filled ? 0 : (sizeof(kernel) / sizeof(*kernel));
+            int imin = filled ? 0 : N_ELEM(kernel);
             // Must be a multiple of 1s (100 samples) always.
-            int imax = filled ? (sizeof(conv_buf) / sizeof(*conv_buf)) : conv_buf_idx;
+            int imax = filled ? N_ELEM(conv_buf) : conv_buf_idx;
 
             for (int i = imin; i < imax; i++)
-                wrapped_conv_buf[i % (sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf))] += conv_buf[i];
+                wrapped_conv_buf[i % N_ELEM(wrapped_conv_buf)] += conv_buf[i];
             // if (conv_buf_idx == 10000)
-            //     for (int i = 0; i < (sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf)); i++) {
+            //     for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
             //         printf("%" PRIi32 "\n", wrapped_conv_buf[i]);
             //     }
             int32_t max = 0;
-            int max_idx = 0;
-            for (int i = 0; i < sizeof(wrapped_conv_buf) / sizeof(*wrapped_conv_buf); i++) {
+            max_idx = 0;
+            for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
                 if (wrapped_conv_buf[i] > max) {
                     max_idx = i;
                     max = wrapped_conv_buf[i];
                 }
             }
-            printf("%d\n", max_idx);
+            // printf("%d\n", max_idx);
         }
-#if 0
-        avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
+        absolute_time_t toc = get_absolute_time();
+        // printf("%llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
+        int conv_buf_idx_mod_1s = conv_buf_idx % N_ELEM(wrapped_conv_buf);
+        bool start_100ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.4)) %
+            N_ELEM(wrapped_conv_buf);
+        bool start_200ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.5)) %
+            N_ELEM(wrapped_conv_buf);
+        bool end_200ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.6)) %
+            N_ELEM(wrapped_conv_buf);
+        if (start_100ms || start_200ms || end_200ms) {
+            prev_avg_avgs[1] = prev_avg_avgs[0];
+            prev_avg_avgs[0] = avg_avg;
+            avg_avg = avg_sum /
+                (start_100ms ? (int)(N_ELEM(wrapped_conv_buf) * 0.8) : (int)(N_ELEM(wrapped_conv_buf) * 0.1));
+            avg_sum = 0;
+        }
+        
         // 75% of the average seems to be a good threshold.
-        bool level = avg > avg_avg * 3 / 4;
+        bool sync_pulse = (start_200ms || end_200ms) && avg_avg > prev_avg_avgs[(int)end_200ms] * 3 / 4;
+        // Due to the lowpass behaviour of the high Q biquad filter, the second window of 100ms, in which
+        // we would see another low level if we have a 1 bit, has a lower average than the first window,
+        // so we can just check whether the average in the first window is higher than the average in the second
+        // 100ms window.
+        printf("%" PRIi32 ", %" PRIi32 ", %d\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1], sync_pulse);
         
-        if (level == prev_level) {
-            prev_level = level;
-            continue;
-        }
-        prev_level = level;
-        
+        avg_sum += avg;
+#if 0
         if (!level) { // Going down.
             uint32_t diff_mod = (timestamp - prev_timestamp) % 1000000ull;
             /**
@@ -432,7 +448,7 @@ int main(void) {
          * Cortex M0+ doesn't have hardware multiplication, so a single multiply would take
          * 16 clock cycles, which is way to slow.
          */
-        for (int i = 0; i < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf); ++i) {
+        for (int i = 0; i < N_ELEM(bpf_output_buf); ++i) {
             // Exponential moving average, based on the formula s[t] = alpha * x[t] + (1 - alpha) * s[t - 1],
             // where alpha is chosen as 1 / 2048 in this case. `sample_buf' is converted to 23.9 fixed point
             // first. Before bitshifting right by 11, we add 0.5 * 2^11 - 1 to round.
@@ -443,10 +459,9 @@ int main(void) {
             // if (i % 10 == 9)
             //     printf("\n");
         }
-        hw_divider_divmod_s32_start(full_spectrum_avg, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+        hw_divider_divmod_s32_start(full_spectrum_avg, N_ELEM(bpf_output_buf));
 
-        filter_biquad_IIR(signed_sample_buf, bpf_output_buf, sizeof(bpf_output_buf) / sizeof(*bpf_output_buf), 
-                          bpf_coeffs, bpf_w);
+        filter_biquad_IIR(signed_sample_buf, bpf_output_buf, N_ELEM(bpf_output_buf), bpf_coeffs, bpf_w);
         
         // The division of the full spectrum average should be done by now (takes 8 clockcycles).
         full_spectrum_avg = hw_divider_s32_quotient_wait();
@@ -461,12 +476,11 @@ int main(void) {
              */
             static int32_t avgs[4] = { 0, 0, 0, 0 };
             avgs[i] = 0;
-            for (int j = sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * i / 4;
-                 j < sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (i + 1) / 4; ++j)
+            for (int j = N_ELEM(bpf_output_buf) * i / 4; j < N_ELEM(bpf_output_buf) * (i + 1) / 4; ++j)
                 avgs[i] += bpf_output_buf[j] < 0 ? -bpf_output_buf[j] : bpf_output_buf[j];
             // We're not dividing by a power of 2 anymore here, but apparently the / operator is using the
             // hardware divider anyway, so it will only take 8 cycles.
-            int32_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf));
+            int32_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / N_ELEM(bpf_output_buf);
             /**
              * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
              * estimate how close the DCF77 signal is to the noise floor.
@@ -489,7 +503,7 @@ int main(void) {
             //                      proc_start_time
             uint64_t timestamp = to_us_since_boot(processing_start_time) -
                 // 1000000ull is the amount of microseconds in a second and 500000ull is the sample rate in Hz.
-                1000000ull / 500000ull * sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) * (2 + 3 - i) / 4;
+                1000000ull / 500000ull * N_ELEM(bpf_output_buf) * (2 + 3 - i) / 4;
             // Send to the other core to process.
             multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
             multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
