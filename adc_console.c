@@ -238,10 +238,7 @@ static const int32_t kernel[] = {
 
 void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
-    enum { UNPROCESSED, PROCESSED, INVALID } bit_status = INVALID;
-    uint32_t prev_diff_mods[2] = { 0u, 0u };
     int32_t avg_sum = 0, avg_avg = 0, prev_avg_avgs[2] = { 0, 0 };
-    bool prev_level = false;
     
     // Making it static because then all elements automatically get initialized to 0,
     // and such large arrays on the stack isn't very pretty.
@@ -269,8 +266,9 @@ void core1_main(void) {
             // Must be a multiple of 1s (100 samples) always.
             int imax = filled ? N_ELEM(conv_buf) : conv_buf_idx;
 
-            for (int i = imin; i < imax; i++)
-                wrapped_conv_buf[i % N_ELEM(wrapped_conv_buf)] += conv_buf[i];
+            for (int i = imin, j = i % N_ELEM(wrapped_conv_buf); i < imax;
+                 i++, j++, j -= (j >= N_ELEM(wrapped_conv_buf) ? N_ELEM(wrapped_conv_buf) : 0))
+                wrapped_conv_buf[j] += conv_buf[i];
             // if (conv_buf_idx == 10000)
             //     for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
             //         printf("%" PRIi32 "\n", wrapped_conv_buf[i]);
@@ -300,67 +298,25 @@ void core1_main(void) {
             avg_avg = avg_sum /
                 (start_100ms ? (int)(N_ELEM(wrapped_conv_buf) * 0.8) : (int)(N_ELEM(wrapped_conv_buf) * 0.1));
             avg_sum = 0;
+
+            if (start_100ms) {
+                // 75% of the average seems to be a good threshold.
+                bool sync_pulse = prev_avg_avgs[1] > avg_avg * 3 / 4;
+                if (sync_pulse) {
+                    printf("%" PRIu32 ": Sync pulse!\n", us_to_ms(timestamp));
+                    bit = 0;
+                } else {
+                    // Due to the lowpass behaviour of the high Q biquad filter, the second window of 100ms, in which
+                    // we would see another low level if we have a 1 bit, has a lower average than the first window,
+                    // so we can just check whether the average in the first window is higher than the average in
+                    // the second 100ms window.
+                    process_bit(timestamp, bit++, prev_avg_avgs[1] > prev_avg_avgs[0]);
+                }
+            }
         }
-        
-        // 75% of the average seems to be a good threshold.
-        bool sync_pulse = (start_200ms || end_200ms) && avg_avg > prev_avg_avgs[(int)end_200ms] * 3 / 4;
-        // Due to the lowpass behaviour of the high Q biquad filter, the second window of 100ms, in which
-        // we would see another low level if we have a 1 bit, has a lower average than the first window,
-        // so we can just check whether the average in the first window is higher than the average in the second
-        // 100ms window.
-        printf("%" PRIi32 ", %" PRIi32 ", %d\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1], sync_pulse);
+        // printf("%" PRIi32 ", %" PRIi32 "\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1]);
         
         avg_sum += avg;
-#if 0
-        if (!level) { // Going down.
-            uint32_t diff_mod = (timestamp - prev_timestamp) % 1000000ull;
-            /**
-             * Is a valid bit if it is either:
-             * -    The 1st bit since boot.
-             * -    Approximately a whole number of seconds after the previous valid bit.
-             * -    Not a whole number of seconds after the previous valid bit, but the previous 2 invalid bits
-             *      have approximately the same modulo, which means that we at some point have missed a lot of bits,
-             *      or that we triggered to a dip caused by noise.
-             */
-            if (is_at_the_end_of_time(from_us_since_boot(prev_timestamp)) ||
-                diff_mod < 50000u || 1000000u - diff_mod < 50000u || // Shouldn't be off more than 50ms.
-                (labs((int32_t)prev_diff_mods[0] - (int32_t)diff_mod) < 50000l &&
-                    labs((int32_t)prev_diff_mods[1] - (int32_t)diff_mod) < 50000l)) {
-                if (timestamp - prev_timestamp > 1950000ull && timestamp - prev_timestamp < 2050000ull &&
-                    bit_status != INVALID) {
-                    // printf("%" PRIu32 ": Sync pulse!\n", us_to_ms(timestamp));
-                    bit = 0;
-                }
-                prev_timestamp = timestamp;
-                bit_status = UNPROCESSED;
-            }
-            prev_diff_mods[1] = prev_diff_mods[0];
-            prev_diff_mods[0] = diff_mod;
-        } else if (bit_status == UNPROCESSED) { // Going up.
-            uint32_t diff = timestamp - prev_timestamp;
-            uint32_t prev_timestamp_ms = us_to_ms(prev_timestamp);
-            bool bit_value = false;
-            
-            if (diff > 300000u) { // Too long, should be either 200ms or 100ms.
-                // printf("%" PRIu32 ": Too long!!!\n", prev_timestamp_ms);
-                bit_status = INVALID;
-            } else if (diff > 150000u) {
-                // printf("%" PRIu32 ": Bit %d, high\n", prev_timestamp_ms, bit);
-                bit_value = true;
-                bit_status = PROCESSED;
-            } else {
-                // printf("%" PRIu32 ": Bit %d, low\n", prev_timestamp_ms, bit);
-                bit_status = PROCESSED;
-            }
-            
-            if (bit_status == PROCESSED) {
-                // process_bit(prev_timestamp, bit, bit_value);
-            } else {
-                
-            }
-            bit++;
-        }
-#endif
     }
 }
 
