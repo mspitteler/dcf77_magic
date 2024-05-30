@@ -21,6 +21,22 @@
 #define MATCHED_FILTER_N_SECONDS 150
 
 #define N_ELEM(a) (sizeof(a) / sizeof(*(a)))
+#define MAX_IDX(a, len, max_idx)                                                                                      \
+    do {                                                                                                              \
+        typeof(*(a)) max = _Generic((a), float *: -infinityf(), double *: -infinity(), long double *: -infinityl(),   \
+                                    /* We need both char and int8_t because char can both be signed and unsigned. */  \
+                                    bool *: false, char *: CHAR_MIN, int8_t *: INT8_MIN, int16_t *: INT16_MIN,        \
+                                    int32_t *: INT32_MIN, int64_t *: INT64_MIN, default: 0);                          \
+        max_idx = 0;                                                                                                  \
+        for (int i = 0; i < len; i++) {                                                                               \
+            if ((a)[i] > max) {                                                                                       \
+                max_idx = i;                                                                                          \
+                max = (a)[i];                                                                                         \
+            }                                                                                                         \
+        }                                                                                                             \
+    } while (0);
+
+enum bit_value_or_sync { LOW, HIGH, SYNC };
 
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
@@ -116,15 +132,50 @@ void dma_handler() {
 
 static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
 
-void process_bit(uint64_t timestamp, int bit, bool bit_value) {
-    static bool backup_antenna = false, announce_dst_switch = false, dst = false, announce_leap_second = false;
+void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
+    static int sync_marks_per_bit[61];
+    static bool backup_antenna = false, announce_dst_switch = false, cest = false, cet = false,
+        announce_leap_second = false;
     static int minutes = -1, hours = -1, day_of_month = -1, day_of_week = -1, month_num = -1, year = -1;
+    static int bit = 0;
+    
+    static int seconds_in_minute = 60;
     
     static bool parity = false;
-    switch (bit) {
+    
+    if (bit_or_sync == SYNC) {
+        // Don't get so high that it could take more than an hour to get back in sync
+        // if for some reason we got the wrong sync.
+        sync_marks_per_bit[bit] += N_ELEM(sync_marks_per_bit);
+        
+        if (sync_marks_per_bit[bit] > 60 * 60)
+            sync_marks_per_bit[bit] = 60 * 60;
+        // Decrement all other elements.
+        for (int i = bit + 1; i < N_ELEM(sync_marks_per_bit); i++) {
+            if (sync_marks_per_bit[i] > 0)
+                sync_marks_per_bit[i]--;
+        }
+        for (int i = 0; i < bit; i++) {
+            if (sync_marks_per_bit[i] > 0)
+                sync_marks_per_bit[i]--;
+        }
+        printf("%" PRIu32 ": Sync mark!\n", us_to_ms(timestamp));
+        goto inc_bit_and_return;
+    }
+    int max_idx;
+    MAX_IDX(sync_marks_per_bit, N_ELEM(sync_marks_per_bit), max_idx);
+    // for (int i = 0; i < N_ELEM(sync_marks_per_bit); i++)
+    //     printf(sync_marks_per_bit[i] ? "%03x" : ".", sync_marks_per_bit[i]);
+    // printf(", max_idx = %d\n", max_idx);
+    
+    bool bit_value = bit_or_sync == HIGH;
+    // Use `max_idx + 1' as that is bit 0 (since `max_idx' itself is the sync mark).
+    int bit_after_sync = (bit + seconds_in_minute - (max_idx + 1)) % seconds_in_minute;
+    switch (bit_after_sync) {
         case 0:
             if (bit_value != false)
                 printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
+            minutes = hours = day_of_month = day_of_week = month_num = year = -1;
             break;
         case 1 ... 14:
             // Meteorological data.
@@ -136,24 +187,31 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
         case 16:
             // Is 1 during the hour before switching.
             announce_dst_switch = bit_value;
-        case 17 ... 18:
-            // DST or no DST.
+        case 17:
+            // CEST (Central European Summer Time).
+            cest = bit_value;
+            break;
+        case 18:
+            // CET (Central European Time).
+            cet = bit_value;
+            if (!(cest ^ cet))
+                printf("%" PRIu32 ": CEST and CET cannot have the same bit value\n", us_to_ms(timestamp));
             break;
         case 19:
             // Is 1 during the hour before the leap second is inserted.
-            announce_leap_second = bit_value;
+            // announce_leap_second = bit_value;
             break;
         case 20:
             if (bit_value != true)
                 printf("%" PRIu32 ": Bit 20 should always be 1!!!\n", us_to_ms(timestamp));
             break;
-        case 21 ... 27:
+        case 21:
+            minutes = 0;
+            parity = false;
+            /* fallthrough */
+        case 22 ... 27:
             // Minutes.
-            if (bit == 21) {
-                minutes = 0;
-                parity = false;
-            }
-            minutes += (int)bit_value * bcd_table[bit - 21];
+            minutes += (int)bit_value * bcd_table[bit_after_sync - 21];
             parity ^= bit_value;
             break;
         case 28:
@@ -161,13 +219,13 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
             if (bit_value != parity)
                 printf("%" PRIu32 ": Parity error in bits 21 ... 27\n", us_to_ms(timestamp));
             break;
-        case 29 ... 34:
+        case 29:
+            hours = 0;
+            parity = false;
+            /* fallthrough */
+        case 30 ... 34:
             // Hours.
-            if (bit == 29) {
-                hours = 0;
-                parity = false;
-            }
-            hours += (int)bit_value * bcd_table[bit - 29];
+            hours += (int)bit_value * bcd_table[bit_after_sync - 29];
             parity ^= bit_value;
             break;
         case 35:
@@ -175,33 +233,36 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
             if (bit_value != parity)
                 printf("%" PRIu32 ": Parity error in bits 29 ... 34\n", us_to_ms(timestamp));
             break;
-        case 36 ... 41:
+        case 36:
+            day_of_month = 0;
+            parity = false;
+            /* fallthrough */
+        case 37 ... 41:
             // Day of month.
-            if (bit == 36) {
-                day_of_month = 0;
-                parity = false;
-            }
-            day_of_month += (int)bit_value * bcd_table[bit - 36];
+            day_of_month += (int)bit_value * bcd_table[bit_after_sync - 36];
             parity ^= bit_value;
             break;
-        case 42 ... 44:
+        case 42:
+            day_of_week = 0;
+            /* fallthrough */
+        case 43 ... 44:
             // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
-            if (bit == 42)
-                day_of_week = 0;
-            day_of_week += (int)bit_value * bcd_table[bit - 42];
+            day_of_week += (int)bit_value * bcd_table[bit_after_sync - 42];
             parity ^= bit_value;
             break;
-        case 45 ... 49:
+        case 45:
+            month_num = 0;
+            /* fallthrough */
+        case 46 ... 49:
             // Month number.
-            if (bit == 45)
-                month_num = 0;
-            month_num += (int)bit_value * bcd_table[bit - 45];
+            month_num += (int)bit_value * bcd_table[bit_after_sync - 45];
             parity ^= bit_value;
             break;
-        case 50 ... 57:
-            if (bit == 50)
-                year = 0;
-            year += (int)bit_value * bcd_table[bit - 50];
+        case 50:
+            year = 0;
+            /* fallthrough */
+        case 51 ... 57:
+            year += (int)bit_value * bcd_table[bit_after_sync - 50];
             parity ^= bit_value;
             // Year.
             break;
@@ -211,10 +272,21 @@ void process_bit(uint64_t timestamp, int bit, bool bit_value) {
                 printf("%" PRIu32 ": Parity error in bits 36 ... 57\n", us_to_ms(timestamp));
             printf("%02d:%02d, %d, %02d-%02d-%02d\n", hours, minutes, day_of_week, day_of_month, month_num, year); 
             break;
-        case 59 ... INT_MAX:
+        case 59:
+            if (announce_leap_second) {
+                // Only occurs when we have a leap second, then it is always 0.
+                if (bit_value != false)
+                    printf("%" PRIu32 ": Bit 59 should always be 0!!!\n", us_to_ms(timestamp));
+            }
+            break;
+        case 60 ... INT_MAX:
             // Invalid.
             break;
     }
+inc_bit_and_return:
+    bit++;
+    if (bit >= seconds_in_minute)
+        bit = 0;
 }
 
 // Kernel is the time inverted expected signal (1 period is 1s):
@@ -273,19 +345,24 @@ void core1_main(void) {
             //     for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
             //         printf("%" PRIi32 "\n", wrapped_conv_buf[i]);
             //     }
-            int32_t max = 0;
-            max_idx = 0;
-            for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
-                if (wrapped_conv_buf[i] > max) {
-                    max_idx = i;
-                    max = wrapped_conv_buf[i];
-                }
-            }
+            MAX_IDX(wrapped_conv_buf, N_ELEM(wrapped_conv_buf), max_idx);
             // printf("%d\n", max_idx);
         }
         absolute_time_t toc = get_absolute_time();
         // printf("%llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
         int conv_buf_idx_mod_1s = conv_buf_idx % N_ELEM(wrapped_conv_buf);
+        //     1 -   ________       ________
+        //                   |  |  |
+        //  0.75 -           |  |  |
+        //                   |  |  |
+        //   0.5 -           |  |  |
+        //                   |  |  |
+        //  0.25 -           |  |  |
+        //                   |  |  |
+        //     0 -           '--'--'
+        //       start_100ms ^  ^  ^
+        //          start_200ms '  |
+        //               end_200ms '
         bool start_100ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.4)) %
             N_ELEM(wrapped_conv_buf);
         bool start_200ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.5)) %
@@ -300,18 +377,14 @@ void core1_main(void) {
             avg_sum = 0;
 
             if (start_100ms) {
-                // 75% of the average seems to be a good threshold.
-                bool sync_pulse = prev_avg_avgs[1] > avg_avg * 3 / 4;
-                if (sync_pulse) {
-                    printf("%" PRIu32 ": Sync pulse!\n", us_to_ms(timestamp));
-                    bit = 0;
-                } else {
-                    // Due to the lowpass behaviour of the high Q biquad filter, the second window of 100ms, in which
-                    // we would see another low level if we have a 1 bit, has a lower average than the first window,
-                    // so we can just check whether the average in the first window is higher than the average in
-                    // the second 100ms window.
-                    process_bit(timestamp, bit++, prev_avg_avgs[1] > prev_avg_avgs[0]);
-                }
+                // 87.5% of the average during the high level seems to be a good threshold.
+                bool sync_mark = prev_avg_avgs[1] > avg_avg * 7 / 8 && prev_avg_avgs[0] > avg_avg * 7 / 8;
+                
+                // Due to the lowpass behaviour of the high Q biquad filter, the second window of 100ms, in which
+                // we would see another low level if we have a 1 bit, has a lower average than the first window,
+                // so we can just check whether the average in the first window is higher than the average in
+                // the second 100ms window.
+                process_bit(timestamp, sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
             }
         }
         // printf("%" PRIi32 ", %" PRIi32 "\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1]);
