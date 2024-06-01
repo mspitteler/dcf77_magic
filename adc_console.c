@@ -21,20 +21,21 @@
 #define MATCHED_FILTER_N_SECONDS 150
 
 #define N_ELEM(a) (sizeof(a) / sizeof(*(a)))
-#define MAX_IDX(a, len, max_idx)                                                                                      \
-    do {                                                                                                              \
+#define MAX_IDX(a, len)                                                                                               \
+    ({                                                                                                                \
         typeof(*(a)) max = _Generic((a), float *: -infinityf(), double *: -infinity(), long double *: -infinityl(),   \
                                     /* We need both char and int8_t because char can both be signed and unsigned. */  \
                                     bool *: false, char *: CHAR_MIN, int8_t *: INT8_MIN, int16_t *: INT16_MIN,        \
                                     int32_t *: INT32_MIN, int64_t *: INT64_MIN, default: 0);                          \
-        max_idx = 0;                                                                                                  \
+        int max_i = 0;                                                                                                \
         for (int i = 0; i < len; i++) {                                                                               \
             if ((a)[i] > max) {                                                                                       \
-                max_idx = i;                                                                                          \
+                max_i = i;                                                                                            \
                 max = (a)[i];                                                                                         \
             }                                                                                                         \
         }                                                                                                             \
-    } while (0);
+        max_i;                                                                                                        \
+    })
 
 enum bit_value_or_sync { LOW, HIGH, SYNC };
 
@@ -162,8 +163,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         printf("%" PRIu32 ": Sync mark!\n", us_to_ms(timestamp));
         goto inc_bit_and_return;
     }
-    int max_idx;
-    MAX_IDX(sync_marks_per_bit, N_ELEM(sync_marks_per_bit), max_idx);
+    int max_idx = MAX_IDX(sync_marks_per_bit, N_ELEM(sync_marks_per_bit));
     // for (int i = 0; i < N_ELEM(sync_marks_per_bit); i++)
     //     printf(sync_marks_per_bit[i] ? "%03x" : ".", sync_marks_per_bit[i]);
     // printf(", max_idx = %d\n", max_idx);
@@ -315,9 +315,9 @@ void core1_main(void) {
     // Making it static because then all elements automatically get initialized to 0,
     // and such large arrays on the stack isn't very pretty.
     static int32_t delay[N_ELEM(kernel)];
-    int conv_buf_idx = 0, max_idx = 0;
+    int conv_buf_idx = 0, max_idx = 0, prev_max_idx = 0;
     
-    for (int bit = 0;;) {
+    while (true) {
         uint64_t timestamp;
         ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
@@ -329,7 +329,10 @@ void core1_main(void) {
             conv_buf_idx = 0;
         
         int32_t wrapped_conv_buf[N_ELEM(kernel)] = { 0 }; 
-        if (conv_buf_idx % N_ELEM(wrapped_conv_buf) == 0) {
+        inline int idx_offs_mod_1s(int idx, int offs) { return (idx + offs) % N_ELEM(wrapped_conv_buf); };
+        
+        int conv_buf_idx_mod_1s = idx_offs_mod_1s(conv_buf_idx, 0);
+        if (conv_buf_idx_mod_1s == 0) {
             // Check if last sample has been written.
             bool filled = conv_buf[N_ELEM(conv_buf) - 1] != -1;
             // Skip the first 100 samples if the averages haven't propagated through the entire delay line yet, so
@@ -338,19 +341,19 @@ void core1_main(void) {
             // Must be a multiple of 1s (100 samples) always.
             int imax = filled ? N_ELEM(conv_buf) : conv_buf_idx;
 
-            for (int i = imin, j = i % N_ELEM(wrapped_conv_buf); i < imax;
+            for (int i = imin, j = idx_offs_mod_1s(i, 0); i < imax;
                  i++, j++, j -= (j >= N_ELEM(wrapped_conv_buf) ? N_ELEM(wrapped_conv_buf) : 0))
                 wrapped_conv_buf[j] += conv_buf[i];
             // if (conv_buf_idx == 10000)
             //     for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
             //         printf("%" PRIi32 "\n", wrapped_conv_buf[i]);
             //     }
-            MAX_IDX(wrapped_conv_buf, N_ELEM(wrapped_conv_buf), max_idx);
+            max_idx = MAX_IDX(wrapped_conv_buf, N_ELEM(wrapped_conv_buf));
             // printf("%d\n", max_idx);
         }
         absolute_time_t toc = get_absolute_time();
         // printf("%llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
-        int conv_buf_idx_mod_1s = conv_buf_idx % N_ELEM(wrapped_conv_buf);
+        
         //     1 -   ________       ________
         //                   |  |  |
         //  0.75 -           |  |  |
@@ -363,12 +366,16 @@ void core1_main(void) {
         //       start_100ms ^  ^  ^
         //          start_200ms '  |
         //               end_200ms '
-        bool start_100ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.4)) %
-            N_ELEM(wrapped_conv_buf);
-        bool start_200ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.5)) %
-            N_ELEM(wrapped_conv_buf);
-        bool end_200ms = conv_buf_idx_mod_1s == (max_idx + (int)(N_ELEM(wrapped_conv_buf) * 0.6)) %
-            N_ELEM(wrapped_conv_buf);
+        bool start_100ms = conv_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.4));
+        bool start_200ms = conv_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.5));
+        bool end_200ms = conv_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.6));
+        // Make sure that we switch to a different `max_idx' only when we are as far away from the windows as possible.
+        int lower_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.9));
+        int higher_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.1));
+        if (lower_lim > higher_lim ? (conv_buf_idx_mod_1s > lower_lim || conv_buf_idx_mod_1s < higher_lim) :
+            (conv_buf_idx_mod_1s > lower_lim && conv_buf_idx_mod_1s < higher_lim))
+            prev_max_idx = max_idx;
+
         if (start_100ms || start_200ms || end_200ms) {
             prev_avg_avgs[1] = prev_avg_avgs[0];
             prev_avg_avgs[0] = avg_avg;
@@ -384,7 +391,21 @@ void core1_main(void) {
                 // we would see another low level if we have a 1 bit, has a lower average than the first window,
                 // so we can just check whether the average in the first window is higher than the average in
                 // the second 100ms window.
-                process_bit(timestamp, sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
+                process_bit(prev_timestamp, sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
+                // Also we have to use the timestamp of the previous start of a 100ms window because we use averages
+                // from 1 and 2 windows ago:
+                //    ____     ________
+                //        | | |        | | |
+                //        | | |        | | |
+                //        | | |        | | |
+                //        '-'-'        '-'-'
+                //     pt ^^ ^  aa ^ t ^
+                //  paa[1] ' |
+                //    paa[0] '
+                //
+                // Where pt is `prev_timestamp', aa is `avg_avg', t is `timestamp', paa[1] is `prev_avg_avgs[1]' and
+                // paa[0] is `prev_avg_avgs[0]'.
+                prev_timestamp = timestamp;
             }
         }
         // printf("%" PRIi32 ", %" PRIi32 "\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1]);
