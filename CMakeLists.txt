@@ -18,6 +18,8 @@ target_link_libraries(adc_console pico_stdlib
         hardware_pio
         pico_multicore)
 
+set_property(TARGET adc_console PROPERTY C_STANDARD 23)
+
 pico_enable_stdio_usb(adc_console 1)
 
 # create map/bin/hex file etc.

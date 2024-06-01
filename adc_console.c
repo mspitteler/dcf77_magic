@@ -135,12 +135,15 @@ static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
 
 void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static int sync_marks_per_bit[61];
-    static bool backup_antenna = false, announce_dst_switch = false, cest = false, cet = false,
-        announce_leap_second = false;
+    static bool backup_antenna = false, announce_dst_switch = false, cest = false, cet = false;
     static int minutes = -1, hours = -1, day_of_month = -1, day_of_week = -1, month_num = -1, year = -1;
     static int bit = 0;
     
-    static int seconds_in_minute = 60;
+    static int announce_leap_second = 0;
+    // When more than half the bits in the last hour had the leap second announcement bit set, we can be fairly
+    // certain that we have a leap second at the last second of the hour.
+    bool last_minute = false;
+    int seconds_in_minute = announce_leap_second > 30 && last_minute ? 61 : 60;
     
     static bool parity = false;
     
@@ -187,6 +190,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 16:
             // Is 1 during the hour before switching.
             announce_dst_switch = bit_value;
+            break;
         case 17:
             // CEST (Central European Summer Time).
             cest = bit_value;
@@ -199,7 +203,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
         case 19:
             // Is 1 during the hour before the leap second is inserted.
-            // announce_leap_second = bit_value;
+            announce_leap_second += (int)bit_value;
             break;
         case 20:
             if (bit_value != true)
@@ -208,7 +212,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 21:
             minutes = 0;
             parity = false;
-            /* fallthrough */
+            [[fallthrough]];
         case 22 ... 27:
             // Minutes.
             minutes += (int)bit_value * bcd_table[bit_after_sync - 21];
@@ -222,7 +226,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 29:
             hours = 0;
             parity = false;
-            /* fallthrough */
+            [[fallthrough]];
         case 30 ... 34:
             // Hours.
             hours += (int)bit_value * bcd_table[bit_after_sync - 29];
@@ -236,7 +240,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 36:
             day_of_month = 0;
             parity = false;
-            /* fallthrough */
+            [[fallthrough]];
         case 37 ... 41:
             // Day of month.
             day_of_month += (int)bit_value * bcd_table[bit_after_sync - 36];
@@ -244,7 +248,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
         case 42:
             day_of_week = 0;
-            /* fallthrough */
+            [[fallthrough]];
         case 43 ... 44:
             // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
             day_of_week += (int)bit_value * bcd_table[bit_after_sync - 42];
@@ -252,7 +256,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
         case 45:
             month_num = 0;
-            /* fallthrough */
+            [[fallthrough]];
         case 46 ... 49:
             // Month number.
             month_num += (int)bit_value * bcd_table[bit_after_sync - 45];
@@ -260,7 +264,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
         case 50:
             year = 0;
-            /* fallthrough */
+            [[fallthrough]];
         case 51 ... 57:
             year += (int)bit_value * bcd_table[bit_after_sync - 50];
             parity ^= bit_value;
@@ -273,11 +277,10 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             printf("%02d:%02d, %d, %02d-%02d-%02d\n", hours, minutes, day_of_week, day_of_month, month_num, year); 
             break;
         case 59:
-            if (announce_leap_second) {
-                // Only occurs when we have a leap second, then it is always 0.
-                if (bit_value != false)
-                    printf("%" PRIu32 ": Bit 59 should always be 0!!!\n", us_to_ms(timestamp));
-            }
+            // Only occurs when we didn't detect a sync mark this minute (so then it is actually bit 0)
+            // or when we have a leap second, in both cases it is always 0.
+            if (bit_value != false)
+                printf("%" PRIu32 ": Bit 59 should always be 0!!!\n", us_to_ms(timestamp));
             break;
         case 60 ... INT_MAX:
             // Invalid.
@@ -287,6 +290,8 @@ inc_bit_and_return:
     bit++;
     if (bit >= seconds_in_minute)
         bit = 0;
+    if (bit_after_sync == 59 && seconds_in_minute == 61)
+        announce_leap_second = 0;
 }
 
 // Kernel is the time inverted expected signal (1 period is 1s):
