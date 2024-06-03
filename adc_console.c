@@ -290,8 +290,8 @@ inc_bit_and_return:
     bit++;
     if (bit >= seconds_in_minute)
         bit = 0;
-    if (bit_after_sync == 59 && seconds_in_minute == 61)
-        announce_leap_second = 0;
+    if (bit_after_sync == seconds_in_minute - 2 && last_minute)
+        announce_leap_second = 0; // Always set back to 0 at last second of the hour.
 }
 
 // Kernel is the time inverted expected signal (1 period is 1s):
