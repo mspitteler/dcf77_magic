@@ -14,6 +14,7 @@
 #include "hardware/dma.h"
 #include "hardware/divider.h"
 #include "pico/multicore.h"
+#include "hardware/rtc.h"
 
 #define CAPTURE_CHANNEL 0
 
@@ -178,6 +179,20 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 0:
             if (bit_value != false)
                 printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
+            datetime_t t = {
+                .year  = 2000 + year,
+                .month = month_num,
+                .day   = day_of_month,
+                .dotw  = day_of_week % 7, // Sunday is 0 instead of 7.
+                .hour  = hours,
+                .min   = minutes,
+                .sec   = 0
+            };
+            rtc_set_datetime(&t);
+            // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
+            // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
+            sleep_us(64);
+            rtc_get_datetime(&t);
             minutes = hours = day_of_month = day_of_week = month_num = year = -1;
             break;
         case 1 ... 14:
@@ -426,6 +441,9 @@ int main(void) {
     stdio_init_all();
     sleep_ms(1000);
     
+    // Start the RTC.
+    rtc_init();
+
     multicore_launch_core1(&core1_main);
     
     generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 15000.); // DCF77 frequency.
