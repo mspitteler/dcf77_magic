@@ -19,7 +19,7 @@
 #define CAPTURE_CHANNEL 0
 
 #define CAPTURE_DEPTH 20000
-#define MATCHED_FILTER_N_SECONDS 150
+#define MATCHED_FILTER_N_SECONDS 300
 
 #define N_ELEM(a) (sizeof(a) / sizeof(*(a)))
 #define MAX_IDX(a, len)                                                                                               \
@@ -44,10 +44,10 @@ enum bit_value_or_sync { LOW, HIGH, SYNC };
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
-static int32_t conv_buf[500000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
+static int16_t avg_buf[500000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
     // Initialize all elements to -1, they should normally never have a negative value, so this is to detect 
     // which elements haven't been set yet.
-    [0 ... N_ELEM(conv_buf) - 1] = -1
+    [0 ... N_ELEM(avg_buf) - 1] = -1
 };
 
 static uint16_t *volatile sample_buf;
@@ -93,23 +93,55 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
     }
 }
 
-// Essentially just a FIR filter.
-int32_t conv_continuous(const int32_t val, const int32_t *const kernel, const int kern_len,
-                        int32_t *const delay) {
-    static int pos = 0;
-    int32_t acc = 0;
-    int kern_pos = kern_len - 1;
-    
-    delay[pos] = val;
-    pos++;
-    if (pos >= kern_len)
-        pos = 0;
-    
-    for (int n = pos; n < kern_len; n++)
-        acc += kernel[kern_pos--] * delay[n];
-    for (int n = 0; n < pos ; n++)
-        acc += kernel[kern_pos--] * delay[n];
-    return acc;
+// `conv_out' will be wrapped to have the same length as the kernel.
+void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t *const kernel, const int kern_len,
+                  int32_t *const conv_out) {
+
+    const int32_t *sig = signal;
+    const int32_t *kern = kernel;
+    int lsig = sig_len;
+    int lkern = kern_len;
+
+    if (sig_len < kern_len) {
+        sig = kernel;
+        kern = signal;
+        lsig = kern_len;
+        lkern = sig_len;
+    }
+
+    for (int n = 0; n < lkern; n++) {
+        size_t k;
+        
+        int n_mod_kern_len = n % kern_len;
+
+        for (k = 0; k <= n; k++)
+            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
+    }
+    for (int n = lkern; n < lsig; n++) {
+        size_t kmin, kmax, k;
+        
+        hw_divider_divmod_s32_start(n, kern_len);
+
+        kmin = n - lkern + 1;
+        kmax = n;
+        
+        int n_mod_kern_len = hw_divider_s32_remainder_wait();
+        for (k = kmin; k <= kmax; k++)
+            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
+    }
+
+    for (int n = lsig; n < lsig + lkern - 1; n++) {
+        size_t kmin, kmax, k;
+        
+        hw_divider_divmod_s32_start(n, kern_len);
+
+        kmin = n - lkern + 1;
+        kmax =  lsig - 1;
+
+        int n_mod_kern_len = hw_divider_s32_remainder_wait();
+        for (k = kmin; k <= kmax; k++)
+            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
+    }
 }
 
 void dma_handler() {
@@ -332,10 +364,8 @@ void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
     int32_t avg_sum = 0, avg_avg = 0, prev_avg_avgs[2] = { 0, 0 };
     
-    // Making it static because then all elements automatically get initialized to 0,
-    // and such large arrays on the stack isn't very pretty.
-    static int32_t delay[N_ELEM(kernel)];
-    int conv_buf_idx = 0, max_idx = 0, prev_max_idx = 0;
+    int32_t wrapped_avg_buf[N_ELEM(avg_buf) / MATCHED_FILTER_N_SECONDS] = { 0 };
+    int avg_buf_idx = 0, max_idx = 0, prev_max_idx = 0;
     
     while (true) {
         uint64_t timestamp;
@@ -343,32 +373,31 @@ void core1_main(void) {
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
         int32_t avg = (int32_t)multicore_fifo_pop_blocking();
         
+        inline int idx_offs_mod_1s(int idx, int offs) { return (idx + offs) % N_ELEM(wrapped_avg_buf); };
+        
         absolute_time_t tic = get_absolute_time();
-        conv_buf[conv_buf_idx++] = conv_continuous(avg, kernel, N_ELEM(kernel), delay);
-        if (conv_buf_idx >= N_ELEM(conv_buf))
-            conv_buf_idx = 0;
+        int avg_buf_idx_mod_1s = idx_offs_mod_1s(avg_buf_idx, 0);
         
-        int32_t wrapped_conv_buf[N_ELEM(kernel)] = { 0 }; 
-        inline int idx_offs_mod_1s(int idx, int offs) { return (idx + offs) % N_ELEM(wrapped_conv_buf); };
+        avg_buf[avg_buf_idx++] = avg;
+        if (avg_buf_idx >= N_ELEM(avg_buf))
+            avg_buf_idx = 0;
         
-        int conv_buf_idx_mod_1s = idx_offs_mod_1s(conv_buf_idx, 0);
-        if (conv_buf_idx_mod_1s == 0) {
-            // Check if last sample has been written.
-            bool filled = conv_buf[N_ELEM(conv_buf) - 1] != -1;
-            // Skip the first 100 samples if the averages haven't propagated through the entire delay line yet, so
-            // that we don't get any startup behaviour in our wrapped buffer.
-            int imin = filled ? 0 : N_ELEM(kernel);
-            // Must be a multiple of 1s (100 samples) always.
-            int imax = filled ? N_ELEM(conv_buf) : conv_buf_idx;
+        wrapped_avg_buf[avg_buf_idx_mod_1s] = 0;
+        for (int i = avg_buf_idx_mod_1s; i < N_ELEM(avg_buf); i += N_ELEM(wrapped_avg_buf)) {
+            if (avg_buf[i] == -1)
+                continue;
+            wrapped_avg_buf[avg_buf_idx_mod_1s] += avg_buf[i];
+        }
+        
+        int32_t conv_out[N_ELEM(kernel)] = { 0 };
+        if (avg_buf_idx_mod_1s == N_ELEM(wrapped_avg_buf) - 1) {
+            conv_wrapped(wrapped_avg_buf, N_ELEM(wrapped_avg_buf), kernel, N_ELEM(kernel), conv_out);
 
-            for (int i = imin, j = idx_offs_mod_1s(i, 0); i < imax;
-                 i++, j++, j -= (j >= N_ELEM(wrapped_conv_buf) ? N_ELEM(wrapped_conv_buf) : 0))
-                wrapped_conv_buf[j] += conv_buf[i];
-            // if (conv_buf_idx == 10000)
-            //     for (int i = 0; i < N_ELEM(wrapped_conv_buf); i++) {
-            //         printf("%" PRIi32 "\n", wrapped_conv_buf[i]);
+            // if (avg_buf_idx == 20000)
+            //     for (int i = 0; i < N_ELEM(conv_out); i++) {
+            //         printf("%" PRIi32 "\n", conv_out[i]);
             //     }
-            max_idx = MAX_IDX(wrapped_conv_buf, N_ELEM(wrapped_conv_buf));
+            max_idx = MAX_IDX(conv_out, N_ELEM(conv_out));
             // printf("%d\n", max_idx);
         }
         absolute_time_t toc = get_absolute_time();
@@ -386,21 +415,20 @@ void core1_main(void) {
         //       start_100ms ^  ^  ^
         //          start_200ms '  |
         //               end_200ms '
-        bool start_100ms = conv_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.4));
-        bool start_200ms = conv_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.5));
-        bool end_200ms = conv_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.6));
+        bool start_100ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.4));
+        bool start_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.5));
+        bool end_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.6));
         // Make sure that we switch to a different `max_idx' only when we are as far away from the windows as possible.
-        int lower_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.9));
-        int higher_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(wrapped_conv_buf) * 0.1));
-        if (lower_lim > higher_lim ? (conv_buf_idx_mod_1s > lower_lim || conv_buf_idx_mod_1s < higher_lim) :
-            (conv_buf_idx_mod_1s > lower_lim && conv_buf_idx_mod_1s < higher_lim))
+        int lower_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.9));
+        int higher_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.1));
+        if (lower_lim > higher_lim ? (avg_buf_idx_mod_1s > lower_lim || avg_buf_idx_mod_1s < higher_lim) :
+            (avg_buf_idx_mod_1s > lower_lim && avg_buf_idx_mod_1s < higher_lim))
             prev_max_idx = max_idx;
 
         if (start_100ms || start_200ms || end_200ms) {
             prev_avg_avgs[1] = prev_avg_avgs[0];
             prev_avg_avgs[0] = avg_avg;
-            avg_avg = avg_sum /
-                (start_100ms ? (int)(N_ELEM(wrapped_conv_buf) * 0.8) : (int)(N_ELEM(wrapped_conv_buf) * 0.1));
+            avg_avg = avg_sum / (start_100ms ? (int)(N_ELEM(conv_out) * 0.8) : (int)(N_ELEM(conv_out) * 0.1));
             avg_sum = 0;
 
             if (start_100ms) {
