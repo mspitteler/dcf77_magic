@@ -303,10 +303,10 @@ void core1_main(void) {
             conv_wrapped(wrapped_avg_buf, sizeof(wrapped_avg_buf) / sizeof(*wrapped_avg_buf),
                          kernel, sizeof(kernel) / sizeof(*kernel), conv_out);
 
-            if (avg_buf_idx == 200)
-                for (int i = 0; i < (sizeof(conv_out) / sizeof(*conv_out)); i++) {
-                    printf("%d\n", conv_out[i]);
-                }
+            // if (avg_buf_idx == 20000)
+            //     for (int i = 0; i < (sizeof(conv_out) / sizeof(*conv_out)); i++) {
+            //         printf("%d\n", conv_out[i]);
+            //     }
         }
         absolute_time_t toc = get_absolute_time();
         // printf("time = %llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
