@@ -18,13 +18,15 @@
 #define CAPTURE_CHANNEL 0
 
 #define CAPTURE_DEPTH 20000
-#define MATCHED_FILTER_N_SECONDS 150
+#define MATCHED_FILTER_N_SECONDS 300
 
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
-static int32_t avg_buf[500000 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS];
+static int16_t avg_buf[500000 / (sizeof(bpf_output_buf) / sizeof(*bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
+    [0 ... sizeof(avg_buf) / sizeof(*avg_buf) - 1] = -1
+};
 
 static uint16_t *volatile sample_buf;
 
@@ -77,8 +79,6 @@ void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t 
     const int32_t *kern = kernel;
     int lsig = sig_len;
     int lkern = kern_len;
-    
-    memset(conv_out, 0, kern_len * sizeof(*conv_out));
 
     if (sig_len < kern_len) {
         sig = kernel;
@@ -274,7 +274,7 @@ void core1_main(void) {
     int32_t avg_avg = 0;
     bool prev_level = false;
     int avg_buf_idx = 0;
-    static int32_t conv_out[sizeof(kernel) / sizeof(*kernel)];
+    int32_t wrapped_avg_buf[sizeof(avg_buf) / sizeof(*avg_buf) / MATCHED_FILTER_N_SECONDS] = { 0 };
     
     for (int bit = 0;;) {
         uint64_t timestamp;
@@ -282,16 +282,34 @@ void core1_main(void) {
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
         int32_t avg = (int32_t)multicore_fifo_pop_blocking();
         
+        absolute_time_t tic = get_absolute_time();
+        int avg_buf_idx_mod_1s = avg_buf_idx % (sizeof(wrapped_avg_buf) / sizeof(*wrapped_avg_buf));
+        
         avg_buf[avg_buf_idx++] = avg;
-        if (avg_buf_idx == sizeof(avg_buf) / sizeof(*avg_buf)) {
-            absolute_time_t tic = get_absolute_time();
-            conv_wrapped(avg_buf, avg_buf_idx, kernel, sizeof(kernel) / sizeof(*kernel), conv_out);
-            absolute_time_t toc = get_absolute_time();
-            for (int i = 0; i < 100; i++)
-                printf("%d\n", conv_out[i]);
-            printf("time = %llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
-            abort();
+        if (avg_buf_idx >= sizeof(avg_buf) / sizeof(*avg_buf))
+            avg_buf_idx = 0;
+        
+        wrapped_avg_buf[avg_buf_idx_mod_1s] = 0;
+        for (int i = avg_buf_idx_mod_1s; i < sizeof(avg_buf) / sizeof(*avg_buf);
+             i += sizeof(wrapped_avg_buf) / sizeof(*wrapped_avg_buf)) {
+            if (avg_buf[i] == -1)
+                continue;
+            wrapped_avg_buf[avg_buf_idx_mod_1s] += avg_buf[i];
         }
+        
+        if (avg_buf_idx_mod_1s == sizeof(wrapped_avg_buf) / sizeof(*wrapped_avg_buf) - 1) {
+            int32_t conv_out[sizeof(kernel) / sizeof(*kernel)] = { 0 };
+            
+            conv_wrapped(wrapped_avg_buf, sizeof(wrapped_avg_buf) / sizeof(*wrapped_avg_buf),
+                         kernel, sizeof(kernel) / sizeof(*kernel), conv_out);
+
+            if (avg_buf_idx == 200)
+                for (int i = 0; i < (sizeof(conv_out) / sizeof(*conv_out)); i++) {
+                    printf("%d\n", conv_out[i]);
+                }
+        }
+        absolute_time_t toc = get_absolute_time();
+        // printf("time = %llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
 #if 0
         avg_avg = ((avg_avg * 511) + avg + 255) >> 9;
         // 75% of the average seems to be a good threshold.
