@@ -16,6 +16,7 @@ target_link_libraries(adc_console pico_stdlib
         hardware_dma
         # For the dummy output:
         hardware_pio
+        hardware_rtc
         pico_multicore)
 
 set_property(TARGET adc_console PROPERTY C_STANDARD 23)
