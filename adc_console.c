@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <time.h>
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -15,6 +16,7 @@
 #include "hardware/divider.h"
 #include "pico/multicore.h"
 #include "hardware/rtc.h"
+#include "pico/critical_section.h"
 
 #define CAPTURE_CHANNEL 0
 
@@ -37,6 +39,26 @@
         }                                                                                                             \
         max_i;                                                                                                        \
     })
+#define TM_TO_DATETIME(tm)                                                                                            \
+    (datetime_t) {                                                                                                    \
+        .year  = (tm).tm_year + 1900, /* Year since 1900. */                                                          \
+        .month = (tm).tm_mon + 1, /* Month from 0 to 11. */                                                           \
+        .day   = (tm).tm_mday,                                                                                        \
+        .dotw  = (tm).tm_wday,                                                                                        \
+        .hour  = (tm).tm_hour,                                                                                        \
+        .min   = (tm).tm_min,                                                                                         \
+        .sec   = (tm).tm_sec                                                                                          \
+    }
+#define DATETIME_TO_TM(datetime)                                                                                      \
+    (struct tm) {                                                                                                     \
+        .tm_year = (datetime).year - 1900, /* Year since 1900. */                                                     \
+        .tm_mon  = (datetime).month - 1, /* Month from 0 to 11. */                                                    \
+        .tm_mday = (datetime).day,                                                                                    \
+        .tm_wday = (datetime).dotw,                                                                                   \
+        .tm_hour = (datetime).hour,                                                                                   \
+        .tm_min  = (datetime).min,                                                                                    \
+        .tm_sec  = (datetime).sec,                                                                                    \
+    }
 
 enum bit_value_or_sync { LOW, HIGH, SYNC };
 
@@ -164,6 +186,31 @@ void dma_handler() {
     // Process what's in the read buffer.
 }
 
+critical_section_t last_rtc_alarm_crit_sec;
+volatile uint64_t last_rtc_alarm_timestamp;
+volatile datetime_t last_rtc_alarm_datetime;
+
+void rtc_alarm_handler() {
+    uint64_t timestamp = to_us_since_boot(get_absolute_time());
+    datetime_t t;
+    rtc_get_datetime((datetime_t *)&t);
+    // Re-enable alarm every second.
+    rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = (t.sec + 1) % 60 }, &rtc_alarm_handler);
+    
+    critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
+    last_rtc_alarm_timestamp = timestamp;
+    last_rtc_alarm_datetime = t;
+    critical_section_exit(&last_rtc_alarm_crit_sec);
+}
+
+int64_t set_rtc(alarm_id_t id, void *user_data) {
+    datetime_t t = TM_TO_DATETIME(*(struct tm *)user_data);
+    rtc_set_datetime(&t);
+    return 0ll;
+}
+
+volatile bool print_max_idx = true;
+
 static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
 
 void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
@@ -211,21 +258,54 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 0:
             if (bit_value != false)
                 printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
-            datetime_t t = {
-                .year  = 2000 + year,
-                .month = month_num,
-                .day   = day_of_month,
-                .dotw  = day_of_week % 7, // Sunday is 0 instead of 7.
-                .hour  = hours,
-                .min   = minutes,
-                .sec   = 0
+            critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
+            struct tm rtc_tm = DATETIME_TO_TM(last_rtc_alarm_datetime);
+            uint64_t rtc_timestamp = last_rtc_alarm_timestamp;
+            critical_section_exit(&last_rtc_alarm_crit_sec);
+            
+            rtc_tm.tm_isdst = -1; // Causes mktime() to determine whether it's DST or not based on the TZ variable.
+            time_t rtc_time = mktime(&rtc_tm);
+
+            struct tm tm = {
+                .tm_year  = 100 + year,
+                .tm_mon   = month_num - 1,
+                .tm_mday  = day_of_month,
+                .tm_wday  = day_of_week % 7, // Sunday is 0 instead of 7.
+                .tm_hour  = hours,
+                .tm_min   = minutes,
+                .tm_sec   = 0,
+                .tm_isdst = -1
             };
-            rtc_set_datetime(&t);
+            minutes = hours = day_of_month = day_of_week = month_num = year = -1;
+
+            // `.tm_wday' will be set after calling mktime(), so we can check if it was correct.
+            int uncorrected_tm_wday = tm.tm_wday;
+            time_t time = mktime(&tm);
+            if (tm.tm_wday != uncorrected_tm_wday)
+                printf("%" PRIu32 ": Weekday doesn't match with calendar!!!\n", us_to_ms(timestamp));
+            int64_t time_diff = time - rtc_time;
+            print_max_idx = llabs(time_diff) > 30ll;
+            printf("%" PRIu32 ": RTC is %s received time by %llds\n", us_to_ms(timestamp),
+                   time_diff > 0 ? "behind" : "ahead of", llabs(time_diff));
+            struct tm *tm_2s_into_future = localtime((time_t []) { time + 2ll }); // Add 2s here as well.
+            if (tm_2s_into_future == NULL) {
+                perror("localtime");
+                break;
+            }
+            // `timestamp' is at least 1s behind where we are now, so add 2s to compensate for processing delay too.
+            // This processing delay also means that it is impossible for the interrupt below to occur at the same time
+            // as this function call.
+            if (add_alarm_at(from_us_since_boot(timestamp + 2000000ull), &set_rtc, tm_2s_into_future, true) < 0) {
+                printf("add_alarm_at: No more alarm slots available\n");
+                break;
+            }
+            // We always set the time to 2s after the minute, so 3s after the minute is the first possible alarm.
+            rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 3 }, &rtc_alarm_handler);
             // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
             // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
             sleep_us(64);
+            datetime_t t;
             rtc_get_datetime(&t);
-            minutes = hours = day_of_month = day_of_week = month_num = year = -1;
             break;
         case 1 ... 14:
             // Meteorological data.
@@ -367,6 +447,8 @@ void core1_main(void) {
     int32_t wrapped_avg_buf[N_ELEM(avg_buf) / MATCHED_FILTER_N_SECONDS] = { 0 };
     int avg_buf_idx = 0, max_idx = 0, prev_max_idx = 0;
     
+    critical_section_init(&last_rtc_alarm_crit_sec);
+    
     while (true) {
         uint64_t timestamp;
         ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
@@ -421,6 +503,13 @@ void core1_main(void) {
         // Make sure that we switch to a different `max_idx' only when we are as far away from the windows as possible.
         int lower_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.9));
         int higher_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.1));
+        if (print_max_idx) {
+            print_max_idx = false;
+            printf("prev_max_idx = %d, start_100ms = %d, start_200ms = %d, end_200ms = %d, lower_lim = %d, "
+                    "higher_lim = %d\n", prev_max_idx, idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.4)),
+                    idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.5)),
+                    idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.6)), lower_lim, higher_lim);
+        }
         if (lower_lim > higher_lim ? (avg_buf_idx_mod_1s > lower_lim || avg_buf_idx_mod_1s < higher_lim) :
             (avg_buf_idx_mod_1s > lower_lim && avg_buf_idx_mod_1s < higher_lim))
             prev_max_idx = max_idx;
@@ -471,6 +560,9 @@ int main(void) {
     
     // Start the RTC.
     rtc_init();
+    // Set timezone to CEST/CET.
+    setenv("TZ", "CEST-1CET,M3.2.0/2:00:00,M11.1.0/2:00:00", 1);
+    tzset();
 
     multicore_launch_core1(&core1_main);
     
