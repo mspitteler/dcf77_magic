@@ -117,7 +117,7 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
 
 // `conv_out' will be wrapped to have the same length as the kernel.
 void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t *const kernel, const int kern_len,
-                  int32_t *const conv_out) {
+                  int64_t *const conv_out) {
 
     const int32_t *sig = signal;
     const int32_t *kern = kernel;
@@ -471,7 +471,7 @@ void core1_main(void) {
             wrapped_avg_buf[avg_buf_idx_mod_1s] += avg_buf[i];
         }
         
-        int32_t conv_out[N_ELEM(kernel)] = { 0 };
+        int64_t conv_out[N_ELEM(kernel)] = { 0 };
         if (avg_buf_idx_mod_1s == N_ELEM(wrapped_avg_buf) - 1) {
             conv_wrapped(wrapped_avg_buf, N_ELEM(wrapped_avg_buf), kernel, N_ELEM(kernel), conv_out);
 
