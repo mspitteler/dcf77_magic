@@ -105,10 +105,10 @@ static void generate_biquad_IIR_bpf(int16_t *const coeffs, const double fs, cons
 void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const int len,
                        const int16_t *const coeffs, int32_t *const w) {
     for (int i = 0; i < len; i++) {
-        // We have to use 64-bit multiplies here sadly, there is not really a way around it if we want high Q,
-        // but it's only two luckily, the other three coefficients can be multiplied with the coefficients downscaled
-        // by 5 bits, since they only affect the output amplitude, and not the behaviour of the filter internally.
-        int32_t d0 = ((int64_t)input[i] - (((int64_t)coeffs[3] * w[0] + (int64_t)coeffs[4] * w[1]) >> (14 - 5))) >> 5;
+        // Because we want such a high Q, we have to scale down w by 5 bits to prevent overflow. As it is now,
+        // we stay well within about half of the range of a 32-bit integer. This does mean that the output is scaled
+        // down by 5 bits as well (divide by 32), but the behaviour of the filter is not altered.
+        int32_t d0 = ((int32_t)input[i] - ((coeffs[3] * w[0] + coeffs[4] * w[1]) >> (14 - 5))) >> 5;
         output[i] = (coeffs[0] * d0 + coeffs[1] * w[0] + coeffs[2] * w[1]) >> 14;
         w[1] = w[0];
         w[0] = d0;
