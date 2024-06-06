@@ -72,7 +72,7 @@ static int16_t avg_buf[500000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_
     [0 ... N_ELEM(avg_buf) - 1] = -1
 };
 
-static uint16_t *volatile sample_buf;
+static uint16_t *volatile sample_buf = nullptr;
 
 static uint dma_chan;
 
@@ -288,7 +288,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             printf("%" PRIu32 ": RTC is %s received time by %llds\n", us_to_ms(timestamp),
                    time_diff > 0 ? "behind" : "ahead of", llabs(time_diff));
             struct tm *tm_2s_into_future = localtime((time_t []) { time + 2ll }); // Add 2s here as well.
-            if (tm_2s_into_future == NULL) {
+            if (tm_2s_into_future == nullptr) {
                 perror("localtime");
                 break;
             }
@@ -628,7 +628,7 @@ int main(void) {
     uint32_t adc_offset = 0u;
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
-        if (sample_buf == NULL || sample_buf == prev_sample_buf)
+        if (sample_buf == nullptr || sample_buf == prev_sample_buf)
             continue;
         absolute_time_t processing_start_time = get_absolute_time();
         int32_t full_spectrum_avg = 0;
