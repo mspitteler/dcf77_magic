@@ -453,7 +453,7 @@ void core1_main(void) {
         uint64_t timestamp;
         ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
         ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
-        int32_t avg = (int32_t)multicore_fifo_pop_blocking();
+        int16_t avg = (int16_t)multicore_fifo_pop_blocking();
         
         inline int idx_offs_mod_1s(int idx, int offs) { return (idx + offs) % N_ELEM(wrapped_avg_buf); };
         
@@ -673,7 +673,7 @@ int main(void) {
                 avgs[i] += bpf_output_buf[j] < 0 ? -bpf_output_buf[j] : bpf_output_buf[j];
             // We're not dividing by a power of 2 anymore here, but apparently the / operator is using the
             // hardware divider anyway, so it will only take 8 cycles.
-            int32_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / N_ELEM(bpf_output_buf);
+            int16_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / N_ELEM(bpf_output_buf);
             /**
              * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
              * estimate how close the DCF77 signal is to the noise floor.
