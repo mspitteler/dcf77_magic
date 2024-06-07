@@ -18,6 +18,8 @@ target_link_libraries(adc_console pico_stdlib
         hardware_pio
         hardware_rtc
         pico_multicore)
+target_compile_definitions(adc_console PRIVATE
+        PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=2000)
 
 set_property(TARGET adc_console PROPERTY C_STANDARD 23)
 

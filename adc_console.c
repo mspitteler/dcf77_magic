@@ -559,7 +559,6 @@ int main(void) {
     int32_t bpf_w[5] = { 0, 0 };
     
     stdio_init_all();
-    sleep_ms(1000);
     
     // Start the RTC.
     rtc_init();
