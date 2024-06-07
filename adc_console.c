@@ -193,7 +193,7 @@ volatile datetime_t last_rtc_alarm_datetime;
 void rtc_alarm_handler() {
     uint64_t timestamp = to_us_since_boot(get_absolute_time());
     datetime_t t;
-    rtc_get_datetime((datetime_t *)&t);
+    rtc_get_datetime(&t);
     // Re-enable alarm every second.
     rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = (t.sec + 1) % 60 }, &rtc_alarm_handler);
     
@@ -210,6 +210,40 @@ int64_t set_rtc(alarm_id_t id, void *user_data) {
 }
 
 volatile bool print_max_idx = true;
+
+void update_time(uint64_t timestamp, struct tm *tm) {
+    critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
+    struct tm rtc_tm = DATETIME_TO_TM(last_rtc_alarm_datetime);
+    uint64_t rtc_timestamp = last_rtc_alarm_timestamp;
+    critical_section_exit(&last_rtc_alarm_crit_sec);
+    
+    rtc_tm.tm_isdst = -1; // Causes mktime() to determine whether it's DST or not based on the TZ variable.
+    time_t rtc_time = mktime(&rtc_tm);
+
+    // `.tm_wday' will be set after calling mktime(), so we can check if it was correct.
+    int uncorrected_tm_wday = tm->tm_wday;
+    time_t time = mktime(tm);
+    if (tm->tm_wday != uncorrected_tm_wday)
+        printf("%" PRIu32 ": Weekday doesn't match with calendar!!!\n", us_to_ms(timestamp));
+    int64_t time_diff = time - rtc_time;
+    print_max_idx = llabs(time_diff) > 30ll;
+    printf("%" PRIu32 ": RTC is %s received time by %llds\n", us_to_ms(timestamp),
+           time_diff > 0 ? "behind" : "ahead of", llabs(time_diff));
+    struct tm *tm_2s_into_future = localtime((time_t []) { time + 2ll }); // Add 2s here as well.
+    if (tm_2s_into_future == nullptr) {
+        perror("localtime");
+        return;
+    }
+    // `timestamp' is at least 1s behind where we are now, so add 2s to compensate for processing delay too.
+    // This processing delay also means that it is impossible for the interrupt below to occur at the same time
+    // as this function call.
+    if (add_alarm_at(from_us_since_boot(timestamp + 2000000ull), &set_rtc, tm_2s_into_future, true) < 0) {
+        printf("add_alarm_at: No more alarm slots available\n");
+        return;
+    }
+    // We always set the time to 2s after the minute, so 3s after the minute is the first possible alarm.
+    rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 3 }, &rtc_alarm_handler);
+}
 
 static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
 
@@ -258,15 +292,8 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 0:
             if (bit_value != false)
                 printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
-            critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
-            struct tm rtc_tm = DATETIME_TO_TM(last_rtc_alarm_datetime);
-            uint64_t rtc_timestamp = last_rtc_alarm_timestamp;
-            critical_section_exit(&last_rtc_alarm_crit_sec);
             
-            rtc_tm.tm_isdst = -1; // Causes mktime() to determine whether it's DST or not based on the TZ variable.
-            time_t rtc_time = mktime(&rtc_tm);
-
-            struct tm tm = {
+            update_time(timestamp, &(struct tm) {
                 .tm_year  = 100 + year,
                 .tm_mon   = month_num - 1,
                 .tm_mday  = day_of_month,
@@ -275,37 +302,13 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
                 .tm_min   = minutes,
                 .tm_sec   = 0,
                 .tm_isdst = -1
-            };
+            });
             minutes = hours = day_of_month = day_of_week = month_num = year = -1;
-
-            // `.tm_wday' will be set after calling mktime(), so we can check if it was correct.
-            int uncorrected_tm_wday = tm.tm_wday;
-            time_t time = mktime(&tm);
-            if (tm.tm_wday != uncorrected_tm_wday)
-                printf("%" PRIu32 ": Weekday doesn't match with calendar!!!\n", us_to_ms(timestamp));
-            int64_t time_diff = time - rtc_time;
-            print_max_idx = llabs(time_diff) > 30ll;
-            printf("%" PRIu32 ": RTC is %s received time by %llds\n", us_to_ms(timestamp),
-                   time_diff > 0 ? "behind" : "ahead of", llabs(time_diff));
-            struct tm *tm_2s_into_future = localtime((time_t []) { time + 2ll }); // Add 2s here as well.
-            if (tm_2s_into_future == nullptr) {
-                perror("localtime");
-                break;
-            }
-            // `timestamp' is at least 1s behind where we are now, so add 2s to compensate for processing delay too.
-            // This processing delay also means that it is impossible for the interrupt below to occur at the same time
-            // as this function call.
-            if (add_alarm_at(from_us_since_boot(timestamp + 2000000ull), &set_rtc, tm_2s_into_future, true) < 0) {
-                printf("add_alarm_at: No more alarm slots available\n");
-                break;
-            }
-            // We always set the time to 2s after the minute, so 3s after the minute is the first possible alarm.
-            rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 3 }, &rtc_alarm_handler);
             // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
             // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
-            sleep_us(64);
-            datetime_t t;
-            rtc_get_datetime(&t);
+            // sleep_us(64);
+            // datetime_t t;
+            // rtc_get_datetime(&t);
             break;
         case 1 ... 14:
             // Meteorological data.
