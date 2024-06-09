@@ -21,9 +21,14 @@
 #define CAPTURE_CHANNEL 0
 
 #define CAPTURE_DEPTH 20000
+// We hava a tolerance of 30ppm for the processor clock, so that means we will drift 30ppm * 300s = 9ms in 300s,
+// which is just a little under the sample time of the averages, which is good, because if the drift would be 
+// significantly higher we would lose in sharpness of the peak in the convolution output buffer.
 #define MATCHED_FILTER_N_SECONDS 300
 
-#define N_ELEM(a) (sizeof(a) / sizeof(*(a)))
+// We don't want the type of N_ELEM to be size_t because that would cause every arithmetic expression that uses this
+// to turn unsigned.
+#define N_ELEM(a) (ssize_t)(sizeof(a) / sizeof(*(a)))
 #define MAX_IDX(a, len)                                                                                               \
     ({                                                                                                                \
         typeof(*(a)) max = _Generic((a), float *: -infinityf(), double *: -infinity(), long double *: -infinityl(),   \
@@ -59,6 +64,14 @@
         .tm_min  = (datetime).min,                                                                                    \
         .tm_sec  = (datetime).sec,                                                                                    \
     }
+// 2.14 fixed point.
+#define LAGRANGE_BASIS(x, x0, x1, x2)                                                                                 \
+    {                                                                                                                 \
+        (int16_t)(((x) - (x1)) * ((x) - (x2)) * 16384. / (((x0) - (x1)) * ((x0) - (x2)))),                            \
+        (int16_t)(((x) - (x0)) * ((x) - (x2)) * 16384. / (((x1) - (x0)) * ((x1) - (x2)))),                            \
+        (int16_t)(((x) - (x0)) * ((x) - (x1)) * 16384. / (((x2) - (x0)) * ((x2) - (x1))))                             \
+    }
+#define LAGRANGE_BASIS_012(x) LAGRANGE_BASIS(x, 0., 1., 2.)
 
 enum bit_value_or_sync { LOW, HIGH, SYNC };
 
@@ -66,7 +79,7 @@ enum bit_value_or_sync { LOW, HIGH, SYNC };
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
-static int16_t avg_buf[500000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
+static int16_t avg_buf[500'000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
     // Initialize all elements to -1, they should normally never have a negative value, so this is to detect 
     // which elements haven't been set yet.
     [0 ... N_ELEM(avg_buf) - 1] = -1
@@ -237,7 +250,7 @@ void update_time(uint64_t timestamp, struct tm *tm) {
     // `timestamp' is at least 1s behind where we are now, so add 2s to compensate for processing delay too.
     // This processing delay also means that it is impossible for the interrupt below to occur at the same time
     // as this function call.
-    if (add_alarm_at(from_us_since_boot(timestamp + 2000000ull), &set_rtc, tm_2s_into_future, true) < 0) {
+    if (add_alarm_at(from_us_since_boot(timestamp + 2'000'000ull), &set_rtc, tm_2s_into_future, true) < 0) {
         printf("add_alarm_at: No more alarm slots available\n");
         return;
     }
@@ -443,12 +456,29 @@ static const int32_t kernel[] = {
     [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.6) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 1.) - 1] = 7,
 };
 
+// Step size after interpolating is 0.05 * 10ms = 500us, so we will get jumps of this length between timestamps,
+// which is quite good.
+static const int16_t lagrange_bases[][3] = {
+    LAGRANGE_BASIS_012(0.),  LAGRANGE_BASIS_012(0.05), LAGRANGE_BASIS_012(0.1), LAGRANGE_BASIS_012(0.15),
+    LAGRANGE_BASIS_012(0.2), LAGRANGE_BASIS_012(0.25), LAGRANGE_BASIS_012(0.3), LAGRANGE_BASIS_012(0.35),
+    LAGRANGE_BASIS_012(0.4), LAGRANGE_BASIS_012(0.45), LAGRANGE_BASIS_012(0.5), LAGRANGE_BASIS_012(0.55),
+    LAGRANGE_BASIS_012(0.6), LAGRANGE_BASIS_012(0.65), LAGRANGE_BASIS_012(0.7), LAGRANGE_BASIS_012(0.75),
+    LAGRANGE_BASIS_012(0.8), LAGRANGE_BASIS_012(0.85), LAGRANGE_BASIS_012(0.9), LAGRANGE_BASIS_012(0.95),
+    LAGRANGE_BASIS_012(1.),  LAGRANGE_BASIS_012(1.05), LAGRANGE_BASIS_012(1.1), LAGRANGE_BASIS_012(1.15),
+    LAGRANGE_BASIS_012(1.2), LAGRANGE_BASIS_012(1.25), LAGRANGE_BASIS_012(1.3), LAGRANGE_BASIS_012(1.35),
+    LAGRANGE_BASIS_012(1.4), LAGRANGE_BASIS_012(1.45), LAGRANGE_BASIS_012(1.5), LAGRANGE_BASIS_012(1.55),
+    LAGRANGE_BASIS_012(1.6), LAGRANGE_BASIS_012(1.65), LAGRANGE_BASIS_012(1.7), LAGRANGE_BASIS_012(1.75),
+    LAGRANGE_BASIS_012(1.8), LAGRANGE_BASIS_012(1.85), LAGRANGE_BASIS_012(1.9), LAGRANGE_BASIS_012(1.95),
+    LAGRANGE_BASIS_012(2.),
+};
+
 void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
+    int timestamp_offset = 0, synced_timestamp_offset = 0;
     int32_t avg_sum = 0, avg_avg = 0, prev_avg_avgs[2] = { 0, 0 };
     
     int32_t wrapped_avg_buf[N_ELEM(avg_buf) / MATCHED_FILTER_N_SECONDS] = { 0 };
-    int avg_buf_idx = 0, max_idx = 0, prev_max_idx = 0;
+    int avg_buf_idx = 0, max_idx = 0, synced_max_idx = 0;
     
     critical_section_init(&last_rtc_alarm_crit_sec);
     
@@ -483,10 +513,38 @@ void core1_main(void) {
             //         printf("%" PRIi32 "\n", conv_out[i]);
             //     }
             max_idx = MAX_IDX(conv_out, N_ELEM(conv_out));
-            // printf("%d\n", max_idx);
+            // Detect fractional maximum with lagrange interpolation so we don't have such large jumps of 10ms in
+            // the timestamps when the maximum changes.
+            int max_idx_min1 = max_idx == 0 ? N_ELEM(conv_out) - 1 : max_idx - 1,
+                max_idx_plus1 = max_idx == N_ELEM(conv_out) - 1 ? 0 : max_idx + 1;
+            int64_t around_max[] = {
+                0ll,
+                conv_out[max_idx] - conv_out[max_idx_min1],
+                conv_out[max_idx_plus1] - conv_out[max_idx_min1],
+            };
+            static_assert(N_ELEM(*lagrange_bases) == N_ELEM(around_max));
+            
+            int64_t lagrange_interpolated[N_ELEM(lagrange_bases)] = { 0 };
+            for (int i = 0; i < N_ELEM(lagrange_bases); i++)
+                for (int j = 0; j < N_ELEM(*lagrange_bases); j++)
+                    lagrange_interpolated[i] += (around_max[j] * lagrange_bases[i][j]) >> 14; // 2.14 fixed point.
+            int lagrange_interpolated_max_idx = MAX_IDX(lagrange_interpolated, N_ELEM(lagrange_interpolated));
+            // 0 ... 40 for `lagrange_interpolated_max_idx' maps to `max_idx' - 1 ... `max_idx' + 1.
+            timestamp_offset = (lagrange_interpolated_max_idx - (N_ELEM(lagrange_bases) - 1) / 2) *
+                (1'000'000l / 500'000l * N_ELEM(bpf_output_buf) / 4) * 2 / (N_ELEM(lagrange_bases) - 1);
+            // printf("max_idx = %d, timestamp_offset = %d\n", max_idx, timestamp_offset);
         }
         absolute_time_t toc = get_absolute_time();
         // printf("%llu\n", to_us_since_boot(toc) - to_us_since_boot(tic));
+        
+        // Make sure that we switch to a different `max_idx' only when we are as far away from the windows as possible.
+        int lower_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.9));
+        int higher_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.1));
+        if (lower_lim > higher_lim ? (avg_buf_idx_mod_1s > lower_lim || avg_buf_idx_mod_1s < higher_lim) :
+            (avg_buf_idx_mod_1s > lower_lim && avg_buf_idx_mod_1s < higher_lim)) {
+            synced_max_idx = max_idx;
+            synced_timestamp_offset = timestamp_offset;
+        }
         
         //     1 -   ________       ________
         //                   |  |  |
@@ -500,22 +558,16 @@ void core1_main(void) {
         //       start_100ms ^  ^  ^
         //          start_200ms '  |
         //               end_200ms '
-        bool start_100ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.4));
-        bool start_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.5));
-        bool end_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.6));
-        // Make sure that we switch to a different `max_idx' only when we are as far away from the windows as possible.
-        int lower_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.9));
-        int higher_lim = idx_offs_mod_1s(max_idx, (int)(N_ELEM(conv_out) * 0.1));
+        bool start_100ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.4));
+        bool start_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.5));
+        bool end_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.6));
         if (print_max_idx) {
             print_max_idx = false;
-            printf("prev_max_idx = %d, start_100ms = %d, start_200ms = %d, end_200ms = %d, lower_lim = %d, "
-                    "higher_lim = %d\n", prev_max_idx, idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.4)),
-                    idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.5)),
-                    idx_offs_mod_1s(prev_max_idx, (int)(N_ELEM(conv_out) * 0.6)), lower_lim, higher_lim);
+            printf("synced_max_idx = %d, start_100ms = %d, start_200ms = %d, end_200ms = %d, lower_lim = %d, "
+                    "higher_lim = %d\n", synced_max_idx, idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.4)),
+                    idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.5)),
+                    idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.6)), lower_lim, higher_lim);
         }
-        if (lower_lim > higher_lim ? (avg_buf_idx_mod_1s > lower_lim || avg_buf_idx_mod_1s < higher_lim) :
-            (avg_buf_idx_mod_1s > lower_lim && avg_buf_idx_mod_1s < higher_lim))
-            prev_max_idx = max_idx;
 
         if (start_100ms || start_200ms || end_200ms) {
             prev_avg_avgs[1] = prev_avg_avgs[0];
@@ -531,7 +583,8 @@ void core1_main(void) {
                 // we would see another low level if we have a 1 bit, has a lower average than the first window,
                 // so we can just check whether the average in the first window is higher than the average in
                 // the second 100ms window.
-                process_bit(prev_timestamp, sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
+                process_bit(prev_timestamp + synced_timestamp_offset,
+                            sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
                 // Also we have to use the timestamp of the previous start of a 100ms window because we use averages
                 // from 1 and 2 windows ago:
                 //    ____     ________
@@ -697,8 +750,8 @@ int main(void) {
             //                            |
             //                      proc_start_time
             uint64_t timestamp = to_us_since_boot(processing_start_time) -
-                // 1000000ull is the amount of microseconds in a second and 500000ull is the sample rate in Hz.
-                1000000ull / 500000ull * N_ELEM(bpf_output_buf) * (2 + 3 - i) / 4;
+                // 1 000 000 is the amount of microseconds in a second and 500 000 is the sample rate in Hz.
+                1'000'000ull / 500'000ull * N_ELEM(bpf_output_buf) * (2 + 3 - i) / 4;
             // Send to the other core to process.
             multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
             multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
