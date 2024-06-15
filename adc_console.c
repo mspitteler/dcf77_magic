@@ -73,7 +73,30 @@
     }
 #define LAGRANGE_BASIS_012(x) LAGRANGE_BASIS(x, 0., 1., 2.)
 
+#define PUSH_MULTICORE_PACKET(packet)                                                                                 \
+    do {                                                                                                              \
+        union multicore_packet p = (packet);                                                                          \
+        multicore_fifo_push_blocking(p.words[0]);                                                                     \
+        multicore_fifo_push_blocking(p.words[1]);                                                                     \
+    } while (false)
+    
+#define POP_MULTICORE_PACKET()                                                                                        \
+    ({                                                                                                                \
+        union multicore_packet p;                                                                                     \
+        p.words[0] = multicore_fifo_pop_blocking();                                                                   \
+        p.words[1] = multicore_fifo_pop_blocking();                                                                   \
+        p;                                                                                                            \
+    })
+
 enum bit_value_or_sync { LOW, HIGH, SYNC };
+
+union multicore_packet {
+    uint32_t words[2];
+    struct {
+        uint64_t timestamp_diff : 48;
+        int16_t avg;
+    };
+};
 
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
@@ -474,6 +497,7 @@ static const int16_t lagrange_bases[][3] = {
 
 void core1_main(void) {
     uint64_t prev_timestamp = to_us_since_boot(at_the_end_of_time);
+    uint64_t timestamp = 0ull;
     int timestamp_offset = 0, synced_timestamp_offset = 0;
     int32_t avg_sum = 0, avg_avg = 0, prev_avg_avgs[2] = { 0, 0 };
     
@@ -483,17 +507,15 @@ void core1_main(void) {
     critical_section_init(&last_rtc_alarm_crit_sec);
     
     while (true) {
-        uint64_t timestamp;
-        ((uint32_t *)&timestamp)[0] = multicore_fifo_pop_blocking();
-        ((uint32_t *)&timestamp)[1] = multicore_fifo_pop_blocking();
-        int16_t avg = (int16_t)multicore_fifo_pop_blocking();
+        union multicore_packet packet = POP_MULTICORE_PACKET();
+        timestamp += packet.timestamp_diff;
         
         inline int idx_offs_mod_1s(int idx, int offs) { return (idx + offs) % N_ELEM(wrapped_avg_buf); };
         
         absolute_time_t tic = get_absolute_time();
         int avg_buf_idx_mod_1s = idx_offs_mod_1s(avg_buf_idx, 0);
         
-        avg_buf[avg_buf_idx++] = avg;
+        avg_buf[avg_buf_idx++] = packet.avg;
         if (avg_buf_idx >= N_ELEM(avg_buf))
             avg_buf_idx = 0;
         
@@ -603,7 +625,7 @@ void core1_main(void) {
         }
         // printf("%" PRIi32 ", %" PRIi32 "\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1]);
         
-        avg_sum += avg;
+        avg_sum += packet.avg;
     }
 }
 
@@ -680,6 +702,7 @@ int main(void) {
 
     uint16_t *prev_sample_buf = sample_buf_pong;
     absolute_time_t prev_time = get_absolute_time();
+    uint64_t prev_timestamp = 0ull;
     uint32_t adc_offset = 0u;
     while (true) {
         // dma_channel_wait_for_finish_blocking(dma_chan);
@@ -753,9 +776,9 @@ int main(void) {
                 // 1 000 000 is the amount of microseconds in a second and 500 000 is the sample rate in Hz.
                 1'000'000ull / 500'000ull * N_ELEM(bpf_output_buf) * (2 + 3 - i) / 4;
             // Send to the other core to process.
-            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[0]);
-            multicore_fifo_push_blocking(((uint32_t *)&timestamp)[1]);
-            multicore_fifo_push_blocking((uint32_t)avg);
+            static_assert(sizeof(union multicore_packet) == 8);
+            PUSH_MULTICORE_PACKET(((union multicore_packet) { .timestamp_diff = timestamp - prev_timestamp, .avg = avg }));
+            prev_timestamp = timestamp;
         }
         absolute_time_t processing_end_time = get_absolute_time();
         // printf("total us: %llu, used us: %llu\n", to_us_since_boot(processing_end_time) - to_us_since_boot(prev_time),
