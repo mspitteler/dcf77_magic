@@ -247,7 +247,9 @@ int64_t set_rtc(alarm_id_t id, void *user_data) {
 
 volatile bool print_max_idx = true;
 
-void update_time(uint64_t timestamp, struct tm *tm) {
+void update_time(uint64_t timestamp, struct tm *tm, bool min_parity_err, bool hour_parity_err, bool date_parity_err) {
+    static struct { int64_t time; int count; } time_counts[20];
+    
     critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
     struct tm rtc_tm = DATETIME_TO_TM(last_rtc_alarm_datetime);
     uint64_t rtc_timestamp = last_rtc_alarm_timestamp;
@@ -285,17 +287,18 @@ static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
 
 void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static int sync_marks_per_bit[61];
-    static bool backup_antenna = false, announce_dst_switch = false, cest = false, cet = false;
+    static bool backup_antenna = false, do_dst_switch = false, cest = false, cet = false;
     static int minutes = -1, hours = -1, day_of_month = -1, day_of_week = -1, month_num = -1, year = -1;
+    static bool minutes_parity_error = true, hours_parity_error = true, date_parity_error = true;
     static int bit = 0;
     
-    static int announce_leap_second = 0;
+    static int announce_dst_switch = 0, announce_leap_second = 0;
     // When more than half the bits in the last hour had the leap second announcement bit set, we can be fairly
     // certain that we have a leap second at the last second of the hour.
     bool last_minute = false;
     int seconds_in_minute = announce_leap_second > 30 && last_minute ? 61 : 60;
-    
-    static bool parity = false;
+    if (bit >= seconds_in_minute)
+        bit = 0;
     
     if (bit_or_sync == SYNC) {
         // Don't get so high that it could take more than an hour to get back in sync
@@ -314,18 +317,26 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
                 sync_marks_per_bit[i]--;
         }
         printf("%" PRIu32 ": Sync mark!\n", us_to_ms(timestamp));
-        goto inc_bit_and_return;
     }
     int max_idx = MAX_IDX(sync_marks_per_bit, N_ELEM(sync_marks_per_bit));
     // for (int i = 0; i < N_ELEM(sync_marks_per_bit); i++)
     //     printf(sync_marks_per_bit[i] ? "%03x" : ".", sync_marks_per_bit[i]);
     // printf(", max_idx = %d\n", max_idx);
     
-    bool bit_value = bit_or_sync == HIGH;
     // Use `max_idx + 1' as that is bit 0 (since `max_idx' itself is the sync mark).
     int bit_after_sync = (bit + seconds_in_minute - (max_idx + 1)) % seconds_in_minute;
+    if (bit_or_sync == SYNC)
+        goto inc_bit_and_return;
+
+    bool bit_value = bit_or_sync == HIGH;
     switch (bit_after_sync) {
         case 0:
+            if (minutes_parity_error || hours_parity_error || date_parity_error)
+                printf("%" PRIu32 ": Parity error in bits%s%s%s.\n", us_to_ms(timestamp),
+                       minutes_parity_error ? " 21 ... 27" : "",
+                       hours_parity_error ? &" and 29 ... 34"[minutes_parity_error ? 0 : 4] : "",
+                       date_parity_error ? &" and 36 ... 57"[hours_parity_error || minutes_parity_error ? 0 : 4] : "");
+            printf("%02d:%02d, %d, %02d-%02d-20%02d\n", hours, minutes, day_of_week, day_of_month, month_num, year);
             if (bit_value != false)
                 printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
             
@@ -338,8 +349,9 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
                 .tm_min   = minutes,
                 .tm_sec   = 0,
                 .tm_isdst = -1
-            });
+            }, minutes_parity_error, hours_parity_error, date_parity_error);
             minutes = hours = day_of_month = day_of_week = month_num = year = -1;
+            minutes_parity_error = hours_parity_error = date_parity_error = true;
             // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
             // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
             // sleep_us(64);
@@ -355,7 +367,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
         case 16:
             // Is 1 during the hour before switching.
-            announce_dst_switch = bit_value;
+            announce_dst_switch += (int)bit_value;
             break;
         case 17:
             // CEST (Central European Summer Time).
@@ -377,40 +389,36 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
         case 21:
             minutes = 0;
-            parity = false;
+            minutes_parity_error = false;
             [[fallthrough]];
         case 22 ... 27:
             // Minutes.
             minutes += (int)bit_value * bcd_table[bit_after_sync - 21];
-            parity ^= bit_value;
-            break;
+            [[fallthrough]];
         case 28:
             // Bit 21 ... 27 even parity.
-            if (bit_value != parity)
-                printf("%" PRIu32 ": Parity error in bits 21 ... 27\n", us_to_ms(timestamp));
+            minutes_parity_error ^= bit_value;
             break;
         case 29:
             hours = 0;
-            parity = false;
+            hours_parity_error = false;
             [[fallthrough]];
         case 30 ... 34:
             // Hours.
             hours += (int)bit_value * bcd_table[bit_after_sync - 29];
-            parity ^= bit_value;
-            break;
+            [[fallthrough]];
         case 35:
             // Bit 29 ... 34 even parity.
-            if (bit_value != parity)
-                printf("%" PRIu32 ": Parity error in bits 29 ... 34\n", us_to_ms(timestamp));
+            hours_parity_error ^= bit_value;
             break;
         case 36:
             day_of_month = 0;
-            parity = false;
+            date_parity_error = false;
             [[fallthrough]];
         case 37 ... 41:
             // Day of month.
             day_of_month += (int)bit_value * bcd_table[bit_after_sync - 36];
-            parity ^= bit_value;
+            date_parity_error ^= bit_value;
             break;
         case 42:
             day_of_week = 0;
@@ -418,7 +426,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 43 ... 44:
             // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
             day_of_week += (int)bit_value * bcd_table[bit_after_sync - 42];
-            parity ^= bit_value;
+            date_parity_error ^= bit_value;
             break;
         case 45:
             month_num = 0;
@@ -426,21 +434,18 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         case 46 ... 49:
             // Month number.
             month_num += (int)bit_value * bcd_table[bit_after_sync - 45];
-            parity ^= bit_value;
+            date_parity_error ^= bit_value;
             break;
         case 50:
             year = 0;
             [[fallthrough]];
         case 51 ... 57:
-            year += (int)bit_value * bcd_table[bit_after_sync - 50];
-            parity ^= bit_value;
             // Year.
-            break;
+            year += (int)bit_value * bcd_table[bit_after_sync - 50];
+            [[fallthrough]];
         case 58:
             // Bit 36 ... 57 even parity.
-            if (bit_value != parity)
-                printf("%" PRIu32 ": Parity error in bits 36 ... 57\n", us_to_ms(timestamp));
-            printf("%02d:%02d, %d, %02d-%02d-%02d\n", hours, minutes, day_of_week, day_of_month, month_num, year); 
+            date_parity_error ^= bit_value;
             break;
         case 59:
             // Only occurs when we didn't detect a sync mark this minute (so then it is actually bit 0)
@@ -453,11 +458,12 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             break;
     }
 inc_bit_and_return:
+    do_dst_switch = false;
+    if (bit_after_sync == seconds_in_minute - 1 && last_minute) {
+        do_dst_switch = announce_dst_switch > 30;
+        announce_dst_switch = announce_leap_second = 0; // Always set back to 0 at last second of the hour.
+    }
     bit++;
-    if (bit >= seconds_in_minute)
-        bit = 0;
-    if (bit_after_sync == seconds_in_minute - 2 && last_minute)
-        announce_leap_second = 0; // Always set back to 0 at last second of the hour.
 }
 
 // Kernel is the time inverted expected signal (1 period is 1s):
