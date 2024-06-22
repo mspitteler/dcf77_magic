@@ -157,9 +157,13 @@ void circular_conv(const int32_t *const signal, const int sig_len, const int32_t
     assert(sig_len == kern_len);
     int N = sig_len;
     
-    for (int n = 0; n < N; n++)
-        for (int m = 0, n_min_m = n + N; m < N; m++, n_min_m--)
-            conv_out[n] += signal[m] * kernel[n_min_m - (n_min_m >= N ? N : 0)];
+    for (int n = 0; n < N; n++) {
+        // Split it up into two parts so we don't need to calculate the modulo of n - k.
+        for (int k = 0; k <= n; k++)
+            conv_out[n] += signal[k] * kernel[n - k];
+        for (int k = n + 1; k < N; k++)
+            conv_out[n] += signal[k] * kernel[n - k + N];
+    }
 }
 
 void dma_handler() {
