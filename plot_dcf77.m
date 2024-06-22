@@ -32,6 +32,8 @@ figure();
 hold('on');
 interpolated = spline(1:length(dcf77_conv_wrapped), dcf77_conv_wrapped, 1:1/20:101-1/20);
 plot(0:1/fs:(length(dcf77_conv_wrapped)-1)/fs, dcf77_conv_wrapped);
+dcf77_cconv = cconv(dcf77, kernel, 100);
+plot(0:1/fs:(length(dcf77_cconv)-1)/fs, dcf77_cconv);
 plot(0:1/2000:(length(interpolated)-1)/2000, interpolated);
 
 [a, b] = max(dcf77_conv_wrapped);

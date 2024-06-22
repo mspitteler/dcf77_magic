@@ -151,55 +151,15 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
     }
 }
 
-// `conv_out' will be wrapped to have the same length as the kernel.
-void conv_wrapped(const int32_t *const signal, const int sig_len, const int32_t *const kernel, const int kern_len,
-                  int64_t *const conv_out) {
-
-    const int32_t *sig = signal;
-    const int32_t *kern = kernel;
-    int lsig = sig_len;
-    int lkern = kern_len;
-
-    if (sig_len < kern_len) {
-        sig = kernel;
-        kern = signal;
-        lsig = kern_len;
-        lkern = sig_len;
-    }
-
-    for (int n = 0; n < lkern; n++) {
-        size_t k;
-        
-        int n_mod_kern_len = n % kern_len;
-
-        for (k = 0; k <= n; k++)
-            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
-    }
-    for (int n = lkern; n < lsig; n++) {
-        size_t kmin, kmax, k;
-        
-        hw_divider_divmod_s32_start(n, kern_len);
-
-        kmin = n - lkern + 1;
-        kmax = n;
-        
-        int n_mod_kern_len = hw_divider_s32_remainder_wait();
-        for (k = kmin; k <= kmax; k++)
-            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
-    }
-
-    for (int n = lsig; n < lsig + lkern - 1; n++) {
-        size_t kmin, kmax, k;
-        
-        hw_divider_divmod_s32_start(n, kern_len);
-
-        kmin = n - lkern + 1;
-        kmax =  lsig - 1;
-
-        int n_mod_kern_len = hw_divider_s32_remainder_wait();
-        for (k = kmin; k <= kmax; k++)
-            conv_out[n_mod_kern_len] += sig[k] * kern[n - k];
-    }
+// Circular convolution, assumes that the signal and the kernel have the same length.
+void circular_conv(const int32_t *const signal, const int sig_len, const int32_t *const kernel, const int kern_len,
+                   int64_t *const conv_out) {
+    assert(sig_len == kern_len);
+    int N = sig_len;
+    
+    for (int n = 0; n < N; n++)
+        for (int m = 0, n_min_m = n + N; m < N; m++, n_min_m--)
+            conv_out[n] += signal[m] * kernel[n_min_m - (n_min_m >= N ? N : 0)];
 }
 
 void dma_handler() {
@@ -534,11 +494,11 @@ void core1_main(void) {
         
         int64_t conv_out[N_ELEM(kernel)] = { 0 };
         if (avg_buf_idx_mod_1s == N_ELEM(wrapped_avg_buf) - 1) {
-            conv_wrapped(wrapped_avg_buf, N_ELEM(wrapped_avg_buf), kernel, N_ELEM(kernel), conv_out);
+            circular_conv(wrapped_avg_buf, N_ELEM(wrapped_avg_buf), kernel, N_ELEM(kernel), conv_out);
 
             // if (avg_buf_idx == 20000)
             //     for (int i = 0; i < N_ELEM(conv_out); i++) {
-            //         printf("%" PRIi32 "\n", conv_out[i]);
+            //         printf("%lld\n", conv_out[i]);
             //     }
             max_idx = MAX_IDX(conv_out, N_ELEM(conv_out));
             // Detect fractional maximum with lagrange interpolation so we don't have such large jumps of 10ms in
