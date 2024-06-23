@@ -98,6 +98,12 @@ union multicore_packet {
     };
 };
 
+struct set_cmp_rtc_data {
+    uint64_t timestamp;
+    datetime_t date;
+    bool min_parity_err, hour_parity_err, date_parity_err;
+};
+
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
@@ -204,55 +210,50 @@ void rtc_alarm_handler() {
 }
 
 int64_t set_rtc(alarm_id_t id, void *user_data) {
-    datetime_t t = TM_TO_DATETIME(*(struct tm *)user_data);
-    rtc_set_datetime(&t);
+    struct set_cmp_rtc_data *data = user_data;
+    
+    rtc_set_datetime(&data->date);
+    // We always set the time to 0s after the minute, but the RTC immediately goes to 1s after the minute,
+    // as discussed further below, so 2s after the minute is the first possible alarm we can catch.
+    rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 2 }, &rtc_alarm_handler);
     return 0ll;
 }
 
-volatile bool print_max_idx = true;
-
-void update_time(uint64_t timestamp, struct tm *tm, bool min_parity_err, bool hour_parity_err, bool date_parity_err) {
-    static struct { int64_t time; int count; } time_counts[20];
+int64_t compare_time(alarm_id_t id, void *user_data) {
+    static struct { datetime_t date; int count; } date_counts[20] = { 0 };
+    struct set_cmp_rtc_data *data = user_data;
     
     critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
-    struct tm rtc_tm = DATETIME_TO_TM(last_rtc_alarm_datetime);
+    datetime_t rtc_datetime = last_rtc_alarm_datetime;
     uint64_t rtc_timestamp = last_rtc_alarm_timestamp;
     critical_section_exit(&last_rtc_alarm_crit_sec);
     
-    rtc_tm.tm_isdst = -1; // Causes mktime() to determine whether it's DST or not based on the TZ variable.
-    time_t rtc_time = mktime(&rtc_tm);
-
-    // `.tm_wday' will be set after calling mktime(), so we can check if it was correct.
-    int uncorrected_tm_wday = tm->tm_wday;
-    time_t time = mktime(tm);
-    if (tm->tm_wday != uncorrected_tm_wday)
-        printf("%" PRIu32 ": Weekday doesn't match with calendar!!!\n", us_to_ms(timestamp));
-    int64_t time_diff = time - rtc_time;
-    print_max_idx = llabs(time_diff) > 30ll;
-    printf("%" PRIu32 ": RTC is %s received time by %llds\n", us_to_ms(timestamp),
-           time_diff > 0 ? "behind" : "ahead of", llabs(time_diff));
-    struct tm *tm_2s_into_future = localtime((time_t []) { time + 2ll }); // Add 2s here as well.
-    if (tm_2s_into_future == nullptr) {
-        perror("localtime");
-        return;
+    static_assert(sizeof(datetime_t) == 8); // The below only works when the size is 8 bytes.
+    if (*(uint64_t *)&rtc_datetime != *(uint64_t *)&data->date) {
+        datetime_t diff = {
+            .sec = rtc_datetime.sec - data->date.sec,
+            .min = rtc_datetime.min - data->date.min,
+            .hour = rtc_datetime.hour - data->date.hour,
+            .day = rtc_datetime.day - data->date.day,
+            .dotw = rtc_datetime.dotw - data->date.dotw,
+            .month = rtc_datetime.month - data->date.month,
+            .year = rtc_datetime.year - data->date.year,
+        };
+        printf("Unequal datetime_t, diff is: ");
+        printf("%02" PRIi8 ":%02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
+               diff.hour, diff.min, diff.sec, diff.dotw, diff.day, diff.month, diff.year);
     }
-    // `timestamp' is at least 1s behind where we are now, so add 2s to compensate for processing delay too.
-    // This processing delay also means that it is impossible for the interrupt below to occur at the same time
-    // as this function call.
-    if (add_alarm_at(from_us_since_boot(timestamp + 2'000'000ull), &set_rtc, tm_2s_into_future, true) < 0) {
-        printf("add_alarm_at: No more alarm slots available\n");
-        return;
-    }
-    // We always set the time to 2s after the minute, so 3s after the minute is the first possible alarm.
-    rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 3 }, &rtc_alarm_handler);
+    return 0ll;
 }
+
+// volatile bool print_max_idx = true;
 
 static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
 
 void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static int sync_marks_per_bit[61];
     static bool backup_antenna = false, do_dst_switch = false, cest = false, cet = false;
-    static int minutes = -1, hours = -1, day_of_month = -1, day_of_week = -1, month_num = -1, year = -1;
+    static datetime_t date = { -1, -1, -1, -1, -1, -1, -1 };
     static bool minutes_parity_error = true, hours_parity_error = true, date_parity_error = true;
     static int bit = 0;
     
@@ -295,32 +296,8 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     bool bit_value = bit_or_sync == HIGH;
     switch (bit_after_sync) {
         case 0:
-            if (minutes_parity_error || hours_parity_error || date_parity_error)
-                printf("%" PRIu32 ": Parity error in bits%s%s%s.\n", us_to_ms(timestamp),
-                       minutes_parity_error ? " 21 ... 27" : "",
-                       hours_parity_error ? &" and 29 ... 34"[minutes_parity_error ? 0 : 4] : "",
-                       date_parity_error ? &" and 36 ... 57"[hours_parity_error || minutes_parity_error ? 0 : 4] : "");
-            printf("%02d:%02d, %d, %02d-%02d-20%02d\n", hours, minutes, day_of_week, day_of_month, month_num, year);
             if (bit_value != false)
                 printf("%" PRIu32 ": Bit 0 should always be 0!!!\n", us_to_ms(timestamp));
-            
-            update_time(timestamp, &(struct tm) {
-                .tm_year  = 100 + year,
-                .tm_mon   = month_num - 1,
-                .tm_mday  = day_of_month,
-                .tm_wday  = day_of_week % 7, // Sunday is 0 instead of 7.
-                .tm_hour  = hours,
-                .tm_min   = minutes,
-                .tm_sec   = 0,
-                .tm_isdst = -1
-            }, minutes_parity_error, hours_parity_error, date_parity_error);
-            minutes = hours = day_of_month = day_of_week = month_num = year = -1;
-            minutes_parity_error = hours_parity_error = date_parity_error = true;
-            // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
-            // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
-            // sleep_us(64);
-            // datetime_t t;
-            // rtc_get_datetime(&t);
             break;
         case 1 ... 14:
             // Meteorological data.
@@ -352,60 +329,60 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
                 printf("%" PRIu32 ": Bit 20 should always be 1!!!\n", us_to_ms(timestamp));
             break;
         case 21:
-            minutes = 0;
+            date.min = 0;
             minutes_parity_error = false;
             [[fallthrough]];
         case 22 ... 27:
             // Minutes.
-            minutes += (int)bit_value * bcd_table[bit_after_sync - 21];
+            date.min += (int)bit_value * bcd_table[bit_after_sync - 21];
             [[fallthrough]];
         case 28:
             // Bit 21 ... 27 even parity.
             minutes_parity_error ^= bit_value;
             break;
         case 29:
-            hours = 0;
+            date.hour = 0;
             hours_parity_error = false;
             [[fallthrough]];
         case 30 ... 34:
             // Hours.
-            hours += (int)bit_value * bcd_table[bit_after_sync - 29];
+            date.hour += (int)bit_value * bcd_table[bit_after_sync - 29];
             [[fallthrough]];
         case 35:
             // Bit 29 ... 34 even parity.
             hours_parity_error ^= bit_value;
             break;
         case 36:
-            day_of_month = 0;
+            date.day = 0;
             date_parity_error = false;
             [[fallthrough]];
         case 37 ... 41:
             // Day of month.
-            day_of_month += (int)bit_value * bcd_table[bit_after_sync - 36];
+            date.day += (int)bit_value * bcd_table[bit_after_sync - 36];
             date_parity_error ^= bit_value;
             break;
         case 42:
-            day_of_week = 0;
+            date.dotw = 0;
             [[fallthrough]];
         case 43 ... 44:
             // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
-            day_of_week += (int)bit_value * bcd_table[bit_after_sync - 42];
+            date.dotw += (int)bit_value * bcd_table[bit_after_sync - 42];
             date_parity_error ^= bit_value;
             break;
         case 45:
-            month_num = 0;
+            date.month = 0;
             [[fallthrough]];
         case 46 ... 49:
             // Month number.
-            month_num += (int)bit_value * bcd_table[bit_after_sync - 45];
+            date.month += (int)bit_value * bcd_table[bit_after_sync - 45];
             date_parity_error ^= bit_value;
             break;
         case 50:
-            year = 0;
+            date.year = 2000; // Year is from 0 to 99, so add 2000 here.
             [[fallthrough]];
         case 51 ... 57:
             // Year.
-            year += (int)bit_value * bcd_table[bit_after_sync - 50];
+            date.year += (int)bit_value * bcd_table[bit_after_sync - 50];
             [[fallthrough]];
         case 58:
             // Bit 36 ... 57 even parity.
@@ -421,6 +398,50 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             // Invalid.
             break;
     }
+    if (bit_after_sync != 58)
+        goto inc_bit_and_return;
+    // Process received date and time.
+    if (minutes_parity_error || hours_parity_error || date_parity_error)
+        printf("%" PRIu32 ": Parity error in bits%s%s%s.\n", us_to_ms(timestamp),
+                minutes_parity_error ? " 21 ... 27" : "",
+                hours_parity_error ? &" and 29 ... 34"[minutes_parity_error ? 0 : 4] : "",
+                date_parity_error ? &" and 36 ... 57"[hours_parity_error || minutes_parity_error ? 0 : 4] : "");
+    printf("%02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
+           date.hour, date.min, date.dotw, date.day, date.month, date.year);
+    
+    if (date.dotw == 7)
+        date.dotw = 0; // Sunday is 0 instead of 7 for the RTC.
+    date.sec = 0;
+    // We are at second 58 now, receiving the date and time for second 0 of the minute that's about to start,
+    // so we would have to add 2 seconds to the timestamp to get to second 0 for setting the new time.
+    // There is one catch however, because of some weird quirk of the RP2040 RTC, if you set it,
+    // the time immediately jumps to the next second, instead of waiting for one second to elapse.
+    // This is why we have to actually add 3 seconds to the timestamp.
+    // More information can be found here: https://forums.raspberrypi.com/viewtopic.php?t=348730
+    // But we compare with the RTC time 500ms before the time would be set (so then the time should still be
+    // 0 seconds after the minute). Do this because that way we make sure that if the RTC is 
+    // slightly behind, we don't get for example RTC: 23:59:59 and received: 00:00:00. We don't want this because
+    // that makes it very hard to determine whether it is actually still almost exactly the same time without 
+    // converting back and forth to Epoch. So we can use the RTC quirk to our advantage in this case actually since
+    // we can check with the same time that we're about to set (0s after the minute) and only need to subtract 500ms
+    // from the timestamp we use for setting.
+    
+    // We don't want it on the stack because it gets used later in an interrupt.
+    static struct set_cmp_rtc_data data;
+    data = (struct set_cmp_rtc_data) {
+        .timestamp = timestamp + 3'000'000ull, .date = date, .min_parity_err = minutes_parity_error,
+        .hour_parity_err = hours_parity_error, .date_parity_err = date_parity_error
+    };
+    if (add_alarm_at(from_us_since_boot(data.timestamp), &set_rtc, &data, true) < 0 ||
+        add_alarm_at(from_us_since_boot(data.timestamp - 500'000ull), &compare_time, &data, true) < 0)
+        printf("add_alarm_at: No more alarm slots available\n");
+    date = (datetime_t) { -1, -1, -1, -1, -1, -1, -1 };
+    minutes_parity_error = hours_parity_error = date_parity_error = true;
+    // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
+    // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
+    // sleep_us(64);
+    // datetime_t t;
+    // rtc_get_datetime(&t);
 inc_bit_and_return:
     do_dst_switch = false;
     if (bit_after_sync == seconds_in_minute - 1 && last_minute) {
@@ -553,13 +574,13 @@ void core1_main(void) {
         bool start_100ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.4));
         bool start_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.5));
         bool end_200ms = avg_buf_idx_mod_1s == idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.6));
-        if (print_max_idx) {
-            print_max_idx = false;
-            printf("synced_max_idx = %d, start_100ms = %d, start_200ms = %d, end_200ms = %d, lower_lim = %d, "
-                    "higher_lim = %d\n", synced_max_idx, idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.4)),
-                    idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.5)),
-                    idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.6)), lower_lim, higher_lim);
-        }
+        // if (print_max_idx) {
+        //     print_max_idx = false;
+        //     printf("synced_max_idx = %d, start_100ms = %d, start_200ms = %d, end_200ms = %d, lower_lim = %d, "
+        //             "higher_lim = %d\n", synced_max_idx, idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.4)),
+        //             idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.5)),
+        //             idx_offs_mod_1s(synced_max_idx, (int)(N_ELEM(conv_out) * 0.6)), lower_lim, higher_lim);
+        // }
 
         if (start_100ms || start_200ms || end_200ms) {
             prev_avg_avgs[1] = prev_avg_avgs[0];
