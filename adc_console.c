@@ -44,26 +44,6 @@
         }                                                                                                             \
         max_i;                                                                                                        \
     })
-#define TM_TO_DATETIME(tm)                                                                                            \
-    (datetime_t) {                                                                                                    \
-        .year  = (tm).tm_year + 1900, /* Year since 1900. */                                                          \
-        .month = (tm).tm_mon + 1, /* Month from 0 to 11. */                                                           \
-        .day   = (tm).tm_mday,                                                                                        \
-        .dotw  = (tm).tm_wday,                                                                                        \
-        .hour  = (tm).tm_hour,                                                                                        \
-        .min   = (tm).tm_min,                                                                                         \
-        .sec   = (tm).tm_sec                                                                                          \
-    }
-#define DATETIME_TO_TM(datetime)                                                                                      \
-    (struct tm) {                                                                                                     \
-        .tm_year = (datetime).year - 1900, /* Year since 1900. */                                                     \
-        .tm_mon  = (datetime).month - 1, /* Month from 0 to 11. */                                                    \
-        .tm_mday = (datetime).day,                                                                                    \
-        .tm_wday = (datetime).dotw,                                                                                   \
-        .tm_hour = (datetime).hour,                                                                                   \
-        .tm_min  = (datetime).min,                                                                                    \
-        .tm_sec  = (datetime).sec,                                                                                    \
-    }
 // 2.14 fixed point.
 #define LAGRANGE_BASIS(x, x0, x1, x2)                                                                                 \
     {                                                                                                                 \
@@ -100,7 +80,17 @@ union multicore_packet {
 
 struct set_cmp_rtc_data {
     uint64_t timestamp;
-    datetime_t date;
+    union date {
+        uint8_t fields[6];
+        struct {
+            uint8_t min, hour, day, dotw, month, year;
+        };
+        // NOTE: The below assumes little endian!!
+        struct {
+            uint8_t min_lo : 4, min_hi : 4, hour_lo : 4, hour_hi : 4, day_lo : 4, day_hi : 4,
+                dotw_lo : 4, dotw_hi : 4, month_lo : 4, month_hi : 4, year_lo : 4, year_hi : 4;
+        };
+    } date;
     bool min_parity_err, hour_parity_err, date_parity_err;
 };
 
@@ -117,6 +107,17 @@ static int16_t avg_buf[500'000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N
 static uint16_t *volatile sample_buf = nullptr;
 
 static uint dma_chan;
+
+static inline void set_bit [[gnu::always_inline]] (uint8_t *field, int bit) { *field |= (1u << bit); }
+static inline void clear_bit [[gnu::always_inline]] (uint8_t *field, int bit) { *field &= ~(1u << bit); }
+static inline void toggle_bit [[gnu::always_inline]] (uint8_t *field, int bit) { *field ^= (1u << bit); }
+static inline bool test_bit [[gnu::always_inline]] (uint8_t field, int bit) { return !!(field & (1u << bit)); }
+static inline void assign_bit [[gnu::always_inline]] (uint8_t *field, int bit, bool val) {
+    if (val)
+        set_bit(field, bit);
+    else
+        clear_bit(field, bit);
+}
 
 static void generate_biquad_IIR_bpf(int16_t *const coeffs, const double fs, const double f_pass, double Q) {
     if (Q <= 0.0001)
@@ -211,8 +212,19 @@ void rtc_alarm_handler() {
 
 int64_t set_rtc(alarm_id_t id, void *user_data) {
     struct set_cmp_rtc_data *data = user_data;
+    // Convert BCD to decimal.
+    datetime_t datetime = {
+        .sec = 0, .min = data->date.min_lo + data->date.min_hi * 10,
+        .hour = data->date.hour_lo + data->date.hour_hi * 10, .day = data->date.day_lo + data->date.day_hi * 10,
+        .dotw = data->date.dotw_lo + data->date.dotw_hi * 10, .month = data->date.month_lo + data->date.month_hi * 10,
+        .year = 2000 + data->date.year_lo + data->date.year_hi * 10, // Year is from 0 to 99, so add 2000 here.
+    };
+    if (datetime.dotw == 7)
+        datetime.dotw = 0; // Sunday is 0 instead of 7 for the RTC.
+    printf("%02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
+           datetime.hour, datetime.min, datetime.dotw, datetime.day, datetime.month, datetime.year);
     
-    rtc_set_datetime(&data->date);
+    rtc_set_datetime(&datetime);
     // We always set the time to 0s after the minute, but the RTC immediately goes to 1s after the minute,
     // as discussed further below, so 2s after the minute is the first possible alarm we can catch.
     rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 2 }, &rtc_alarm_handler);
@@ -220,7 +232,7 @@ int64_t set_rtc(alarm_id_t id, void *user_data) {
 }
 
 int64_t compare_time(alarm_id_t id, void *user_data) {
-    static struct { datetime_t date; int count; } date_counts[20] = { 0 };
+    static int field_diffs[6][8];
     struct set_cmp_rtc_data *data = user_data;
     
     critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
@@ -228,32 +240,57 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
     uint64_t rtc_timestamp = last_rtc_alarm_timestamp;
     critical_section_exit(&last_rtc_alarm_crit_sec);
     
-    static_assert(sizeof(datetime_t) == 8); // The below only works when the size is 8 bytes.
-    if (*(uint64_t *)&rtc_datetime != *(uint64_t *)&data->date) {
-        datetime_t diff = {
-            .sec = rtc_datetime.sec - data->date.sec,
-            .min = rtc_datetime.min - data->date.min,
-            .hour = rtc_datetime.hour - data->date.hour,
-            .day = rtc_datetime.day - data->date.day,
-            .dotw = rtc_datetime.dotw - data->date.dotw,
-            .month = rtc_datetime.month - data->date.month,
-            .year = rtc_datetime.year - data->date.year,
-        };
-        printf("Unequal datetime_t, diff is: ");
-        printf("%02" PRIi8 ":%02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
-               diff.hour, diff.min, diff.sec, diff.dotw, diff.day, diff.month, diff.year);
+    rtc_datetime.year -= 2000;
+    if (rtc_datetime.dotw == 0)
+        rtc_datetime.dotw = 7; // Sunday is 0 instead of 7 for the RTC.
+    union date rtc_date = {
+        .min_lo = rtc_datetime.min % 10, .min_hi = rtc_datetime.min / 10,
+        .hour_lo = rtc_datetime.hour % 10, .hour_hi = rtc_datetime.hour / 10,
+        .day_lo = rtc_datetime.day % 10, .day_hi = rtc_datetime.day / 10,
+        .dotw_lo = rtc_datetime.dotw % 10, .dotw_hi = rtc_datetime.dotw / 10,
+        .month_lo = rtc_datetime.month % 10, .month_hi = rtc_datetime.month / 10,
+        .year_lo = rtc_datetime.year % 10, .year_hi = rtc_datetime.year / 10
+    };
+    if (rtc_datetime.sec != 0)
+        printf("Sync mark moved!\n");
+    
+    if (rtc_date.min != data->date.min || rtc_date.hour != data->date.hour || rtc_date.day != data->date.day ||
+        rtc_date.dotw != data->date.dotw || rtc_date.month != data->date.month || rtc_date.year != data->date.year) {
+        printf("Unequal date: [%06hhb]:[%07hhb], [%03hhb], [%06hhb]-[%05hhb]-[%08hhb]!\n",
+               rtc_date.hour ^ data->date.hour, rtc_date.min ^ data->date.min, rtc_date.dotw ^ data->date.dotw,
+               rtc_date.day ^ data->date.day, rtc_date.month ^ data->date.month, rtc_date.year ^ data->date.year);
     }
+    
+    union date old_rtc_date = rtc_date;
+    for (int i = 0; i < N_ELEM(field_diffs); i++) {
+        for (int j = 0; j < N_ELEM(*field_diffs); j++) {
+            field_diffs[i][j] += (test_bit(rtc_date.fields[i], j) ^ test_bit(data->date.fields[i], j)) ? -1 : 1;
+            if (field_diffs[i][j] > 10)
+                field_diffs[i][j] = 10;
+            else if (field_diffs[i][j] < 0) {
+                toggle_bit(&rtc_date.fields[i], j);
+                // Assume that it is correct now.
+                field_diffs[i][j] = 10;
+            }
+        }
+    }
+    
+    if (rtc_date.min != old_rtc_date.min || rtc_date.hour != old_rtc_date.hour || rtc_date.day != old_rtc_date.day ||
+        rtc_date.dotw != old_rtc_date.dotw || rtc_date.month != old_rtc_date.month ||
+        rtc_date.year != old_rtc_date.year) {
+        printf("Changing RTC date!!!\n");
+    }
+    
+    data->date = rtc_date;
     return 0ll;
 }
 
 // volatile bool print_max_idx = true;
 
-static const int bcd_table[] = { 1, 2, 4, 8, 10, 20, 40, 80 };
-
 void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static int sync_marks_per_bit[61];
     static bool backup_antenna = false, do_dst_switch = false, cest = false, cet = false;
-    static datetime_t date = { -1, -1, -1, -1, -1, -1, -1 };
+    static union date date = { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
     static bool minutes_parity_error = true, hours_parity_error = true, date_parity_error = true;
     static int bit = 0;
     
@@ -329,60 +366,60 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
                 printf("%" PRIu32 ": Bit 20 should always be 1!!!\n", us_to_ms(timestamp));
             break;
         case 21:
-            date.min = 0;
+            date.min = 0x00;
             minutes_parity_error = false;
             [[fallthrough]];
         case 22 ... 27:
             // Minutes.
-            date.min += (int)bit_value * bcd_table[bit_after_sync - 21];
+            assign_bit(&date.min, bit_after_sync - 21, bit_value);
             [[fallthrough]];
         case 28:
             // Bit 21 ... 27 even parity.
             minutes_parity_error ^= bit_value;
             break;
         case 29:
-            date.hour = 0;
+            date.hour = 0x00;
             hours_parity_error = false;
             [[fallthrough]];
         case 30 ... 34:
             // Hours.
-            date.hour += (int)bit_value * bcd_table[bit_after_sync - 29];
+            assign_bit(&date.hour, bit_after_sync - 29, bit_value);
             [[fallthrough]];
         case 35:
             // Bit 29 ... 34 even parity.
             hours_parity_error ^= bit_value;
             break;
         case 36:
-            date.day = 0;
+            date.day = 0x00;
             date_parity_error = false;
             [[fallthrough]];
         case 37 ... 41:
             // Day of month.
-            date.day += (int)bit_value * bcd_table[bit_after_sync - 36];
+            assign_bit(&date.day, bit_after_sync - 36, bit_value);
             date_parity_error ^= bit_value;
             break;
         case 42:
-            date.dotw = 0;
+            date.dotw = 0x00;
             [[fallthrough]];
         case 43 ... 44:
             // Day of week (1 = Monday, 2 = Tuesday, ..., 7 = Sunday).
-            date.dotw += (int)bit_value * bcd_table[bit_after_sync - 42];
+            assign_bit(&date.dotw, bit_after_sync - 42, bit_value);
             date_parity_error ^= bit_value;
             break;
         case 45:
-            date.month = 0;
+            date.month = 0x00;
             [[fallthrough]];
         case 46 ... 49:
             // Month number.
-            date.month += (int)bit_value * bcd_table[bit_after_sync - 45];
+            assign_bit(&date.month, bit_after_sync - 45, bit_value);
             date_parity_error ^= bit_value;
             break;
         case 50:
-            date.year = 2000; // Year is from 0 to 99, so add 2000 here.
+            date.year = 0x00;
             [[fallthrough]];
         case 51 ... 57:
             // Year.
-            date.year += (int)bit_value * bcd_table[bit_after_sync - 50];
+            assign_bit(&date.year, bit_after_sync - 50, bit_value);
             [[fallthrough]];
         case 58:
             // Bit 36 ... 57 even parity.
@@ -406,12 +443,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
                 minutes_parity_error ? " 21 ... 27" : "",
                 hours_parity_error ? &" and 29 ... 34"[minutes_parity_error ? 0 : 4] : "",
                 date_parity_error ? &" and 36 ... 57"[hours_parity_error || minutes_parity_error ? 0 : 4] : "");
-    printf("%02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
-           date.hour, date.min, date.dotw, date.day, date.month, date.year);
     
-    if (date.dotw == 7)
-        date.dotw = 0; // Sunday is 0 instead of 7 for the RTC.
-    date.sec = 0;
     // We are at second 58 now, receiving the date and time for second 0 of the minute that's about to start,
     // so we would have to add 2 seconds to the timestamp to get to second 0 for setting the new time.
     // There is one catch however, because of some weird quirk of the RP2040 RTC, if you set it,
@@ -435,7 +467,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     if (add_alarm_at(from_us_since_boot(data.timestamp), &set_rtc, &data, true) < 0 ||
         add_alarm_at(from_us_since_boot(data.timestamp - 500'000ull), &compare_time, &data, true) < 0)
         printf("add_alarm_at: No more alarm slots available\n");
-    date = (datetime_t) { -1, -1, -1, -1, -1, -1, -1 };
+    date = (union date) { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
     minutes_parity_error = hours_parity_error = date_parity_error = true;
     // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
     // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
