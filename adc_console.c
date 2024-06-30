@@ -231,6 +231,29 @@ int64_t set_rtc(alarm_id_t id, void *user_data) {
     return 0ll;
 }
 
+bool is_valid_xor_mask(const uint8_t *const fields, const int idx, const uint8_t xor_mask) {
+    uint8_t field = fields[idx];
+    field ^= xor_mask;
+    // Convert BDC to decimal.
+    int field_dec = (field & 0x0f) + (field >> 4) * 10;
+    switch (idx) {
+        case offsetof(union date, min):
+            return field_dec <= 59;
+        case offsetof(union date, hour):
+            return field_dec <= 23;
+        case offsetof(union date, day):
+            return field_dec >= 1 && field_dec <= 31;
+        case offsetof(union date, dotw):
+            return field_dec >= 1 && field_dec <= 7;
+        case offsetof(union date, month):
+            return field_dec >= 1 && field_dec <= 12;
+        case offsetof(union date, year):
+            return field_dec >= 0 && field_dec <= 99;
+        default: // Should never happen.
+            return false;
+    }
+};
+
 int64_t compare_time(alarm_id_t id, void *user_data) {
     static int field_diffs[6][8];
     struct set_cmp_rtc_data *data = user_data;
@@ -261,23 +284,30 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
                rtc_date.day ^ data->date.day, rtc_date.month ^ data->date.month, rtc_date.year ^ data->date.year);
     }
     
-    union date old_rtc_date = rtc_date;
+    union date prev_rtc_date = rtc_date;
+    static_assert(N_ELEM(field_diffs) == N_ELEM(rtc_date.fields));
     for (int i = 0; i < N_ELEM(field_diffs); i++) {
+        uint8_t field_xor_mask = 0x00;
         for (int j = 0; j < N_ELEM(*field_diffs); j++) {
             field_diffs[i][j] += (test_bit(rtc_date.fields[i], j) ^ test_bit(data->date.fields[i], j)) ? -1 : 1;
             if (field_diffs[i][j] > 10)
                 field_diffs[i][j] = 10;
-            else if (field_diffs[i][j] < 0) {
-                toggle_bit(&rtc_date.fields[i], j);
-                // Assume that it is correct now.
-                field_diffs[i][j] = 10;
-            }
+            else if (field_diffs[i][j] < 0)
+                set_bit(&field_xor_mask, j);
+        }
+        // Only toggle the bits when it will result in a valid field. If it doesn't we wait for other bits to be
+        // toggled too, so that we get a valid field again.
+        if (is_valid_xor_mask(rtc_date.fields, i, field_xor_mask)) {
+            rtc_date.fields[i] ^= field_xor_mask;
+            for (int j = 0; j < N_ELEM(*field_diffs); j++)
+                if (test_bit(field_xor_mask, j))
+                    field_diffs[i][j] = 10; // Assume that it is correct now.
         }
     }
     
-    if (rtc_date.min != old_rtc_date.min || rtc_date.hour != old_rtc_date.hour || rtc_date.day != old_rtc_date.day ||
-        rtc_date.dotw != old_rtc_date.dotw || rtc_date.month != old_rtc_date.month ||
-        rtc_date.year != old_rtc_date.year) {
+    if (rtc_date.min != prev_rtc_date.min || rtc_date.hour != prev_rtc_date.hour || rtc_date.day != prev_rtc_date.day ||
+        rtc_date.dotw != prev_rtc_date.dotw || rtc_date.month != prev_rtc_date.month ||
+        rtc_date.year != prev_rtc_date.year) {
         printf("Changing RTC date!!!\n");
     }
     
