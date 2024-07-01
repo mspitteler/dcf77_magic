@@ -14,6 +14,7 @@ pico_sdk_init()
 target_link_libraries(adc_console pico_stdlib
         hardware_adc
         hardware_dma
+        hardware_pwm
         # For the dummy output:
         hardware_pio
         hardware_rtc

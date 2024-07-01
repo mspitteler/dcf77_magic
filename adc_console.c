@@ -13,6 +13,7 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "hardware/pwm.h"
 #include "hardware/divider.h"
 #include "pico/multicore.h"
 #include "hardware/rtc.h"
@@ -685,6 +686,7 @@ void core1_main(void) {
 int main(void) {
     int16_t bpf_coeffs[5];
     int32_t bpf_w[5] = { 0, 0 };
+    int32_t avgs[4] = { 0, 0, 0, 0 };
     
     stdio_init_all();
     
@@ -698,6 +700,26 @@ int main(void) {
     
     generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 15000.); // DCF77 frequency.
     
+    /**
+     * Initialize onboard LED indicator for showing the average of the BPF output.
+     */
+    // Tell GPIO 25 it is allocated to the PWM.
+    gpio_set_function(PICO_DEFAULT_LED_PIN, GPIO_FUNC_PWM);
+
+    // Find out which PWM slice is connected to GPIO 25.
+    uint slice_num = pwm_gpio_to_slice_num(PICO_DEFAULT_LED_PIN);
+    uint chan = pwm_gpio_to_channel(PICO_DEFAULT_LED_PIN);
+
+    // Set period of 32768 cycles (0 to 32767 inclusive).
+    pwm_set_wrap(slice_num, INT16_MAX);
+    // Set channel A output high for 0 cycles, so the LED stays off.
+    pwm_set_chan_level(slice_num, chan, 0);
+    // Set the PWM running.
+    pwm_set_enabled(slice_num, true);
+    
+    /**
+     * Initialize ADC with a sample rate of 500kHz and DMA with ping-pong buffers.
+     */
     // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
     adc_gpio_init(26 + CAPTURE_CHANNEL);
 
@@ -798,13 +820,15 @@ int main(void) {
              * but I tested it and it is not significantly slower to do it seperately, and we have enough
              * RAM anyway, so it is more elegant to do it seperately I think.
              */
-            static int32_t avgs[4] = { 0, 0, 0, 0 };
             avgs[i] = 0;
             for (int j = N_ELEM(bpf_output_buf) * i / 4; j < N_ELEM(bpf_output_buf) * (i + 1) / 4; ++j)
                 avgs[i] += bpf_output_buf[j] < 0 ? -bpf_output_buf[j] : bpf_output_buf[j];
             // We're not dividing by a power of 2 anymore here, but apparently the / operator is using the
             // hardware divider anyway, so it will only take 8 cycles.
             int16_t avg = (avgs[0] + avgs[1] + avgs[2] + avgs[3]) / N_ELEM(bpf_output_buf);
+            // Update indicator LED, square `avg' for gamma correction and bitshift by 15 to the right to get it in the 
+            // same scale again.
+            pwm_set_chan_level(slice_num, chan, ((int32_t)avg * (int32_t)avg) >> 15);
             /**
              * TODO: Check ratio between average after bandpass filter and average of full spectrum, so that we can
              * estimate how close the DCF77 signal is to the noise floor.
