@@ -109,11 +109,11 @@ static uint16_t *volatile sample_buf = nullptr;
 
 static uint dma_chan;
 
-static inline void set_bit [[gnu::always_inline]] (uint8_t *field, int bit) { *field |= (1u << bit); }
-static inline void clear_bit [[gnu::always_inline]] (uint8_t *field, int bit) { *field &= ~(1u << bit); }
-static inline void toggle_bit [[gnu::always_inline]] (uint8_t *field, int bit) { *field ^= (1u << bit); }
+static inline void set_bit [[gnu::always_inline]] (uint8_t *const field, int bit) { *field |= (1u << bit); }
+static inline void clear_bit [[gnu::always_inline]] (uint8_t *const field, int bit) { *field &= ~(1u << bit); }
+static inline void toggle_bit [[gnu::always_inline]] (uint8_t *const field, int bit) { *field ^= (1u << bit); }
 static inline bool test_bit [[gnu::always_inline]] (uint8_t field, int bit) { return !!(field & (1u << bit)); }
-static inline void assign_bit [[gnu::always_inline]] (uint8_t *field, int bit, bool val) {
+static inline void assign_bit [[gnu::always_inline]] (uint8_t *const field, int bit, bool val) {
     if (val)
         set_bit(field, bit);
     else
