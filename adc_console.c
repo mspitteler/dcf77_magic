@@ -358,9 +358,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     
     // Use `max_idx + 1' as that is bit 0 (since `max_idx' itself is the sync mark).
     int bit_after_sync = (bit + seconds_in_minute - (max_idx + 1)) % seconds_in_minute;
-    if (bit_or_sync == SYNC)
-        goto inc_bit_and_return;
-
+    // Also low if it's a sync mark, which is the most likely if the sync mark was misdetected. 
     bool bit_value = bit_or_sync == HIGH;
     switch (bit_after_sync) {
         case 0:
@@ -466,46 +464,46 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             // Invalid.
             break;
     }
-    if (bit_after_sync != 58)
-        goto inc_bit_and_return;
-    // Process received date and time.
-    if (minutes_parity_error || hours_parity_error || date_parity_error)
-        printf("%" PRIu32 ": Parity error in bits%s%s%s.\n", us_to_ms(timestamp),
-                minutes_parity_error ? " 21 ... 27" : "",
-                hours_parity_error ? &" and 29 ... 34"[minutes_parity_error ? 0 : 4] : "",
-                date_parity_error ? &" and 36 ... 57"[hours_parity_error || minutes_parity_error ? 0 : 4] : "");
-    
-    // We are at second 58 now, receiving the date and time for second 0 of the minute that's about to start,
-    // so we would have to add 2 seconds to the timestamp to get to second 0 for setting the new time.
-    // There is one catch however, because of some weird quirk of the RP2040 RTC, if you set it,
-    // the time immediately jumps to the next second, instead of waiting for one second to elapse.
-    // This is why we have to actually add 3 seconds to the timestamp.
-    // More information can be found here: https://forums.raspberrypi.com/viewtopic.php?t=348730
-    // But we compare with the RTC time 500ms before the time would be set (so then the time should still be
-    // 0 seconds after the minute). Do this because that way we make sure that if the RTC is 
-    // slightly behind, we don't get for example RTC: 23:59:59 and received: 00:00:00. We don't want this because
-    // that makes it very hard to determine whether it is actually still almost exactly the same time without 
-    // converting back and forth to Epoch. So we can use the RTC quirk to our advantage in this case actually since
-    // we can check with the same time that we're about to set (0s after the minute) and only need to subtract 500ms
-    // from the timestamp we use for setting.
-    
-    // We don't want it on the stack because it gets used later in an interrupt.
-    static struct set_cmp_rtc_data data;
-    data = (struct set_cmp_rtc_data) {
-        .timestamp = timestamp + 3'000'000ull, .date = date, .min_parity_err = minutes_parity_error,
-        .hour_parity_err = hours_parity_error, .date_parity_err = date_parity_error
-    };
-    if (add_alarm_at(from_us_since_boot(data.timestamp), &set_rtc, &data, true) < 0 ||
-        add_alarm_at(from_us_since_boot(data.timestamp - 500'000ull), &compare_time, &data, true) < 0)
-        printf("add_alarm_at: No more alarm slots available\n");
-    date = (union date) { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
-    minutes_parity_error = hours_parity_error = date_parity_error = true;
-    // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
-    // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
-    // sleep_us(64);
-    // datetime_t t;
-    // rtc_get_datetime(&t);
-inc_bit_and_return:
+    if (bit_after_sync == 58) {
+        // Process received date and time.
+        if (minutes_parity_error || hours_parity_error || date_parity_error)
+            printf("%" PRIu32 ": Parity error in bits%s%s%s.\n", us_to_ms(timestamp),
+                    minutes_parity_error ? " 21 ... 27" : "",
+                    hours_parity_error ? &" and 29 ... 34"[minutes_parity_error ? 0 : 4] : "",
+                    date_parity_error ? &" and 36 ... 57"[hours_parity_error || minutes_parity_error ? 0 : 4] : "");
+        
+        // We are at second 58 now, receiving the date and time for second 0 of the minute that's about to start,
+        // so we would have to add 2 seconds to the timestamp to get to second 0 for setting the new time.
+        // There is one catch however, because of some weird quirk of the RP2040 RTC, if you set it,
+        // the time immediately jumps to the next second, instead of waiting for one second to elapse.
+        // This is why we have to actually add 3 seconds to the timestamp.
+        // More information can be found here: https://forums.raspberrypi.com/viewtopic.php?t=348730
+        // But we compare with the RTC time 500ms before the time would be set (so then the time should still be
+        // 0 seconds after the minute). Do this because that way we make sure that if the RTC is 
+        // slightly behind, we don't get for example RTC: 23:59:59 and received: 00:00:00. We don't want this because
+        // that makes it very hard to determine whether it is actually still almost exactly the same time without 
+        // converting back and forth to Epoch. So we can use the RTC quirk to our advantage in this case actually since
+        // we can check with the same time that we're about to set (0s after the minute) and only need to subtract 500ms
+        // from the timestamp we use for setting.
+        
+        // We don't want it on the stack because it gets used later in an interrupt.
+        static struct set_cmp_rtc_data data;
+        data = (struct set_cmp_rtc_data) {
+            .timestamp = timestamp + 3'000'000ull, .date = date, .min_parity_err = minutes_parity_error,
+            .hour_parity_err = hours_parity_error, .date_parity_err = date_parity_error
+        };
+        if (add_alarm_at(from_us_since_boot(data.timestamp), &set_rtc, &data, true) < 0 ||
+            add_alarm_at(from_us_since_boot(data.timestamp - 500'000ull), &compare_time, &data, true) < 0)
+            printf("add_alarm_at: No more alarm slots available\n");
+        date = (union date) { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
+        minutes_parity_error = hours_parity_error = date_parity_error = true;
+        // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
+        // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
+        // sleep_us(64);
+        // datetime_t t;
+        // rtc_get_datetime(&t);
+    }
+
     do_dst_switch = false;
     if (bit_after_sync == seconds_in_minute - 1 && last_minute) {
         do_dst_switch = announce_dst_switch > 30;
