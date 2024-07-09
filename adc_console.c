@@ -222,10 +222,14 @@ int64_t set_rtc(alarm_id_t id, void *user_data) {
     };
     if (datetime.dotw == 7)
         datetime.dotw = 0; // Sunday is 0 instead of 7 for the RTC.
-    printf("%02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
-           datetime.hour, datetime.min, datetime.dotw, datetime.day, datetime.month, datetime.year);
     
     rtc_set_datetime(&datetime);
+    absolute_time_t rtc_set_datetime_time = get_absolute_time();
+    
+    printf("Setting %02" PRIi8 ":%02" PRIi8 ", %" PRIi8 ", %02" PRIi8 "-%02" PRIi8 "-%" PRIi16 "\n",
+           datetime.hour, datetime.min, datetime.dotw, datetime.day, datetime.month, datetime.year);
+    printf("Set RTC %lluus too late!\n", to_us_since_boot(rtc_set_datetime_time) - data->timestamp);
+    
     // We always set the time to 0s after the minute, but the RTC immediately goes to 1s after the minute,
     // as discussed further below, so 2s after the minute is the first possible alarm we can catch.
     rtc_set_alarm(&(datetime_t) { -1, -1, -1, -1, -1, -1, .sec = 2 }, &rtc_alarm_handler);
