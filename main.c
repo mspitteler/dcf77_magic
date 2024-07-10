@@ -289,6 +289,8 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
                rtc_date.day ^ data->date.day, rtc_date.month ^ data->date.month, rtc_date.year ^ data->date.year);
     }
     
+    // TODO: Do something with the detected parity errors.
+    
     union date prev_rtc_date = rtc_date;
     static_assert(N_ELEM(field_diffs) == N_ELEM(rtc_date.fields));
     for (int i = 0; i < N_ELEM(field_diffs); i++) {
@@ -332,6 +334,9 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static int announce_dst_switch = 0, announce_leap_second = 0;
     // When more than half the bits in the last hour had the leap second announcement bit set, we can be fairly
     // certain that we have a leap second at the last second of the hour.
+    
+    // TODO: Set `last_minute' to true if the date and time are stable for quite a while and it is indeed the
+    // last minute of the hour.
     bool last_minute = false;
     int seconds_in_minute = announce_leap_second > 30 && last_minute ? 61 : 60;
     if (bit >= seconds_in_minute)
@@ -380,6 +385,10 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             // Is 1 during the hour before switching.
             announce_dst_switch += (int)bit_value;
             break;
+        /**
+         * TODO: Do something with CEST and CET, so the RTC can switch cleanly between them without having to
+         * resynchronize, which could take a while if we have a lot of bit errors.
+         */
         case 17:
             // CEST (Central European Summer Time).
             cest = bit_value;
