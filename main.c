@@ -27,6 +27,11 @@
 // significantly higher we would lose in sharpness of the peak in the convolution output buffer.
 #define MATCHED_FILTER_N_SECONDS 300
 
+#define SAMPLE_RATE 500'000l // Sample rate of the ADC when clkdiv is 0.
+// Number of average amplitudes per second after the filter. The average is taken over all 20000 samples, but upsampled
+// by a factor 4, so we get 100 amplitude averages per second.
+#define AVGS_PER_SECOND (SAMPLE_RATE / (N_ELEM(bpf_output_buf) / 4l))
+
 // We don't want the type of N_ELEM to be size_t because that would cause every arithmetic expression that uses this
 // to turn unsigned.
 #define N_ELEM(a) (ssize_t)(sizeof(a) / sizeof(*(a)))
@@ -99,7 +104,7 @@ struct set_cmp_rtc_data {
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
-static int16_t avg_buf[500'000 / (N_ELEM(bpf_output_buf) / 4) * MATCHED_FILTER_N_SECONDS] = {
+static int16_t avg_buf[AVGS_PER_SECOND * MATCHED_FILTER_N_SECONDS] = {
     // Initialize all elements to -1, they should normally never have a negative value, so this is to detect 
     // which elements haven't been set yet.
     [0 ... N_ELEM(avg_buf) - 1] = -1
@@ -538,10 +543,10 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
 //     0 -             '--'
 //
 static const int32_t kernel[] = {
-    [0 ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.4) - 1] = 7,
-    [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.4) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.5) - 1] = 3,
-    [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.5) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.6) - 1] = 0,
-    [(int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 0.6) ... (int)(0.5e6 / (N_ELEM(bpf_output_buf) / 4.) * 1.) - 1] = 7,
+    [0 ... (int)(AVGS_PER_SECOND * 0.4) - 1] = 7,
+    [(int)(AVGS_PER_SECOND * 0.4) ... (int)(AVGS_PER_SECOND * 0.5) - 1] = 3,
+    [(int)(AVGS_PER_SECOND * 0.5) ... (int)(AVGS_PER_SECOND * 0.6) - 1] = 0,
+    [(int)(AVGS_PER_SECOND * 0.6) ... (int)(AVGS_PER_SECOND * 1.) - 1] = 7,
 };
 
 // Step size after interpolating is 0.05 * 10ms = 500us, so we will get jumps of this length between timestamps,
@@ -566,7 +571,7 @@ void core1_main(void) {
     int timestamp_offset = 0, synced_timestamp_offset = 0;
     int32_t avg_sum = 0, avg_avg = 0, prev_avg_avgs[2] = { 0, 0 };
     
-    int32_t wrapped_avg_buf[N_ELEM(avg_buf) / MATCHED_FILTER_N_SECONDS] = { 0 };
+    int32_t wrapped_avg_buf[AVGS_PER_SECOND] = { 0 };
     int avg_buf_idx = 0, max_idx = 0, synced_max_idx = 0;
     
     critical_section_init(&last_rtc_alarm_crit_sec);
@@ -618,7 +623,7 @@ void core1_main(void) {
             int lagrange_interpolated_max_idx = MAX_IDX(lagrange_interpolated, N_ELEM(lagrange_interpolated));
             // 0 ... 40 for `lagrange_interpolated_max_idx' maps to `max_idx' - 1 ... `max_idx' + 1.
             timestamp_offset = (lagrange_interpolated_max_idx - (N_ELEM(lagrange_bases) - 1) / 2) *
-                (1'000'000l / 500'000l * N_ELEM(bpf_output_buf) / 4) * 2 / (N_ELEM(lagrange_bases) - 1);
+                (1'000'000l / AVGS_PER_SECOND * 2l / (N_ELEM(lagrange_bases) - 1l));
             // printf("max_idx = %d, timestamp_offset = %d\n", max_idx, timestamp_offset);
         }
         absolute_time_t toc = get_absolute_time();
@@ -709,7 +714,7 @@ int main(void) {
 
     multicore_launch_core1(&core1_main);
     
-    generate_biquad_IIR_bpf(bpf_coeffs, 0.5e6, 77.5e3, 15000.); // DCF77 frequency.
+    generate_biquad_IIR_bpf(bpf_coeffs, (double)SAMPLE_RATE, 77.5e3, 15000.); // DCF77 frequency.
     
     /**
      * Initialize onboard LED indicator for showing the average of the BPF output.
@@ -860,9 +865,10 @@ int main(void) {
             //     ( )( )( )( )[ ][ ][ ][ ]
             //                            |
             //                      proc_start_time
-            uint64_t timestamp = to_us_since_boot(processing_start_time) -
-                // 1 000 000 is the amount of microseconds in a second and 500 000 is the sample rate in Hz.
-                1'000'000ull / 500'000ull * N_ELEM(bpf_output_buf) * (2 + 3 - i) / 4;
+            
+            // 1 000 000 is the amount of microseconds in a second, so with 1 000 000 / AVGS_PER_SECOND we get
+            // the amount of microseconds per avg.
+            uint64_t timestamp = to_us_since_boot(processing_start_time) - 1'000'000ull / AVGS_PER_SECOND * (2 + 3 - i);
             // Send to the other core to process.
             static_assert(sizeof(union multicore_packet) == 8);
             PUSH_MULTICORE_PACKET(((union multicore_packet) { .timestamp_diff = timestamp - prev_timestamp, .avg = avg }));
