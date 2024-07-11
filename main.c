@@ -86,7 +86,7 @@ union multicore_packet {
 
 struct set_cmp_rtc_data {
     uint64_t timestamp;
-    union date {
+    union bcd_date {
         uint8_t fields[6];
         struct {
             uint8_t min, hour, day, dotw, month, year;
@@ -96,7 +96,7 @@ struct set_cmp_rtc_data {
             uint8_t min_lo : 4, min_hi : 4, hour_lo : 4, hour_hi : 4, day_lo : 4, day_hi : 4,
                 dotw_lo : 4, dotw_hi : 4, month_lo : 4, month_hi : 4, year_lo : 4, year_hi : 4;
         };
-    } date;
+    } bcd_date;
     bool min_parity_err, hour_parity_err, date_parity_err;
 };
 
@@ -220,10 +220,12 @@ int64_t set_rtc(alarm_id_t id, void *user_data) {
     struct set_cmp_rtc_data *data = user_data;
     // Convert BCD to decimal.
     datetime_t datetime = {
-        .sec = 0, .min = data->date.min_lo + data->date.min_hi * 10,
-        .hour = data->date.hour_lo + data->date.hour_hi * 10, .day = data->date.day_lo + data->date.day_hi * 10,
-        .dotw = data->date.dotw_lo + data->date.dotw_hi * 10, .month = data->date.month_lo + data->date.month_hi * 10,
-        .year = 2000 + data->date.year_lo + data->date.year_hi * 10, // Year is from 0 to 99, so add 2000 here.
+        .sec = 0, .min = data->bcd_date.min_lo + data->bcd_date.min_hi * 10,
+        .hour = data->bcd_date.hour_lo + data->bcd_date.hour_hi * 10,
+        .day = data->bcd_date.day_lo + data->bcd_date.day_hi * 10,
+        .dotw = data->bcd_date.dotw_lo + data->bcd_date.dotw_hi * 10,
+        .month = data->bcd_date.month_lo + data->bcd_date.month_hi * 10,
+        .year = 2000 + data->bcd_date.year_lo + data->bcd_date.year_hi * 10, // Year is from 0 to 99, so add 2000 here.
     };
     if (datetime.dotw == 7)
         datetime.dotw = 0; // Sunday is 0 instead of 7 for the RTC.
@@ -247,17 +249,17 @@ bool is_valid_xor_mask(const uint8_t *const fields, const int idx, const uint8_t
     // Convert BDC to decimal.
     int field_dec = (field & 0x0f) + (field >> 4) * 10;
     switch (idx) {
-        case offsetof(union date, min):
+        case offsetof(union bcd_date, min):
             return field_dec <= 59;
-        case offsetof(union date, hour):
+        case offsetof(union bcd_date, hour):
             return field_dec <= 23;
-        case offsetof(union date, day):
+        case offsetof(union bcd_date, day):
             return field_dec >= 1 && field_dec <= 31;
-        case offsetof(union date, dotw):
+        case offsetof(union bcd_date, dotw):
             return field_dec >= 1 && field_dec <= 7;
-        case offsetof(union date, month):
+        case offsetof(union bcd_date, month):
             return field_dec >= 1 && field_dec <= 12;
-        case offsetof(union date, year):
+        case offsetof(union bcd_date, year):
             return field_dec >= 0 && field_dec <= 99;
         default: // Should never happen.
             return false;
@@ -276,7 +278,7 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
     rtc_datetime.year -= 2000;
     if (rtc_datetime.dotw == 0)
         rtc_datetime.dotw = 7; // Sunday is 0 instead of 7 for the RTC.
-    union date rtc_date = {
+    union bcd_date rtc_bcd_date = {
         .min_lo = rtc_datetime.min % 10, .min_hi = rtc_datetime.min / 10,
         .hour_lo = rtc_datetime.hour % 10, .hour_hi = rtc_datetime.hour / 10,
         .day_lo = rtc_datetime.day % 10, .day_hi = rtc_datetime.day / 10,
@@ -287,21 +289,23 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
     if (rtc_datetime.sec != 0)
         printf("Sync mark moved!\n");
     
-    if (rtc_date.min != data->date.min || rtc_date.hour != data->date.hour || rtc_date.day != data->date.day ||
-        rtc_date.dotw != data->date.dotw || rtc_date.month != data->date.month || rtc_date.year != data->date.year) {
+    if (rtc_bcd_date.min != data->bcd_date.min || rtc_bcd_date.hour != data->bcd_date.hour ||
+        rtc_bcd_date.day != data->bcd_date.day || rtc_bcd_date.dotw != data->bcd_date.dotw ||
+        rtc_bcd_date.month != data->bcd_date.month || rtc_bcd_date.year != data->bcd_date.year) {
         printf("Unequal date: [%06hhb]:[%07hhb], [%03hhb], [%06hhb]-[%05hhb]-[%08hhb]!\n",
-               rtc_date.hour ^ data->date.hour, rtc_date.min ^ data->date.min, rtc_date.dotw ^ data->date.dotw,
-               rtc_date.day ^ data->date.day, rtc_date.month ^ data->date.month, rtc_date.year ^ data->date.year);
+               rtc_bcd_date.hour ^ data->bcd_date.hour, rtc_bcd_date.min ^ data->bcd_date.min,
+               rtc_bcd_date.dotw ^ data->bcd_date.dotw, rtc_bcd_date.day ^ data->bcd_date.day,
+               rtc_bcd_date.month ^ data->bcd_date.month, rtc_bcd_date.year ^ data->bcd_date.year);
     }
     
     // TODO: Do something with the detected parity errors.
     
-    union date prev_rtc_date = rtc_date;
-    static_assert(N_ELEM(field_diffs) == N_ELEM(rtc_date.fields));
+    union bcd_date prev_rtc_bcd_date = rtc_bcd_date;
+    static_assert(N_ELEM(field_diffs) == N_ELEM(rtc_bcd_date.fields));
     for (int i = 0; i < N_ELEM(field_diffs); i++) {
         uint8_t field_xor_mask = 0x00;
         for (int j = 0; j < N_ELEM(*field_diffs); j++) {
-            field_diffs[i][j] += (test_bit(rtc_date.fields[i], j) ^ test_bit(data->date.fields[i], j)) ? -1 : 1;
+            field_diffs[i][j] += (test_bit(rtc_bcd_date.fields[i], j) ^ test_bit(data->bcd_date.fields[i], j)) ? -1 : 1;
             if (field_diffs[i][j] > 10)
                 field_diffs[i][j] = 10;
             else if (field_diffs[i][j] < 0)
@@ -309,21 +313,21 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
         }
         // Only toggle the bits when it will result in a valid field. If it doesn't we wait for other bits to be
         // toggled too, so that we get a valid field again.
-        if (is_valid_xor_mask(rtc_date.fields, i, field_xor_mask)) {
-            rtc_date.fields[i] ^= field_xor_mask;
+        if (is_valid_xor_mask(rtc_bcd_date.fields, i, field_xor_mask)) {
+            rtc_bcd_date.fields[i] ^= field_xor_mask;
             for (int j = 0; j < N_ELEM(*field_diffs); j++)
                 if (test_bit(field_xor_mask, j))
                     field_diffs[i][j] = 10; // Assume that it is correct now.
         }
     }
     
-    if (rtc_date.min != prev_rtc_date.min || rtc_date.hour != prev_rtc_date.hour || rtc_date.day != prev_rtc_date.day ||
-        rtc_date.dotw != prev_rtc_date.dotw || rtc_date.month != prev_rtc_date.month ||
-        rtc_date.year != prev_rtc_date.year) {
+    if (rtc_bcd_date.min != prev_rtc_bcd_date.min || rtc_bcd_date.hour != prev_rtc_bcd_date.hour ||
+        rtc_bcd_date.day != prev_rtc_bcd_date.day || rtc_bcd_date.dotw != prev_rtc_bcd_date.dotw ||
+        rtc_bcd_date.month != prev_rtc_bcd_date.month || rtc_bcd_date.year != prev_rtc_bcd_date.year) {
         printf("Changing RTC date!!!\n");
     }
     
-    data->date = rtc_date;
+    data->bcd_date = rtc_bcd_date;
     return 0ll;
 }
 
@@ -332,7 +336,7 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
 void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static int sync_marks_per_bit[61];
     static bool backup_antenna = false, do_dst_switch = false, cest = false, cet = false;
-    static union date date = { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
+    static union bcd_date date = { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
     static bool minutes_parity_error = true, hours_parity_error = true, date_parity_error = true;
     static int bit = 0;
     
@@ -507,13 +511,13 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         // We don't want it on the stack because it gets used later in an interrupt.
         static struct set_cmp_rtc_data data;
         data = (struct set_cmp_rtc_data) {
-            .timestamp = timestamp + 3'000'000ull, .date = date, .min_parity_err = minutes_parity_error,
+            .timestamp = timestamp + 3'000'000ull, .bcd_date = date, .min_parity_err = minutes_parity_error,
             .hour_parity_err = hours_parity_error, .date_parity_err = date_parity_error
         };
         if (add_alarm_at(from_us_since_boot(data.timestamp), &set_rtc, &data, true) < 0 ||
             add_alarm_at(from_us_since_boot(data.timestamp - 500'000ull), &compare_time, &data, true) < 0)
             printf("add_alarm_at: No more alarm slots available\n");
-        date = (union date) { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
+        date = (union bcd_date) { .min = 0xff, .hour = 0xff, .day = 0xff, .dotw = 0xff, .month = 0xff, .year = 0xff };
         minutes_parity_error = hours_parity_error = date_parity_error = true;
         // clk_sys is >2000x faster than clk_rtc, so datetime is not updated immediately when rtc_get_datetime()
         // is called. The delay is up to 3 RTC clock cycles (which is 64us with the default clock settings).
