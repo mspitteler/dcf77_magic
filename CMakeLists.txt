@@ -21,6 +21,7 @@ target_link_libraries(dcf77_magic pico_stdlib
         pico_multicore)
 target_compile_definitions(dcf77_magic PRIVATE
         PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=2000)
+# set_source_files_properties(main.c PROPERTIES COMPILE_FLAGS "-Dprintf\\(...\\)=")
 
 set_property(TARGET dcf77_magic PROPERTY C_STANDARD 23)
 

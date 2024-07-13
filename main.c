@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/unistd.h>
 #include <stdbool.h>
 #include <assert.h>
 #include <math.h>
@@ -218,6 +219,15 @@ void rtc_alarm_handler() {
 
 int64_t set_rtc(alarm_id_t id, void *user_data) {
     struct set_cmp_rtc_data *data = user_data;
+    int flags = 0x01;
+    char s[] = "00-00-00-00-00-00-01-00\r";
+    s[0] += data->bcd_date.year_hi, s[1] += data->bcd_date.year_lo, s[3] += data->bcd_date.month_hi;
+    s[4] += data->bcd_date.month_lo, s[6] += data->bcd_date.day_hi, s[7] += data->bcd_date.day_lo;
+    s[9] += data->bcd_date.dotw_hi, s[10] += data->bcd_date.dotw_lo, s[12] += data->bcd_date.hour_hi; 
+    s[13] += data->bcd_date.hour_lo, s[15] += data->bcd_date.min_hi, s[16] += data->bcd_date.min_lo, s[22] += flags;
+    
+    write(1, s, N_ELEM(s) - 1);
+    
     // Convert BCD to decimal.
     datetime_t datetime = {
         .sec = 0, .min = data->bcd_date.min_lo + data->bcd_date.min_hi * 10,
