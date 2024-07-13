@@ -202,7 +202,7 @@ void dma_handler() {
 
 critical_section_t last_rtc_alarm_crit_sec;
 volatile uint64_t last_rtc_alarm_timestamp;
-volatile datetime_t last_rtc_alarm_datetime;
+volatile datetime_t last_rtc_alarm_datetime = { .year = 2000, .month = 1, .day = 1 };
 
 void rtc_alarm_handler() {
     uint64_t timestamp = to_us_since_boot(get_absolute_time());
@@ -689,8 +689,7 @@ void core1_main(void) {
                 // we would see another low level if we have a 1 bit, has a lower average than the first window,
                 // so we can just check whether the average in the first window is higher than the average in
                 // the second 100ms window.
-                process_bit(prev_timestamp + synced_timestamp_offset,
-                            sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
+                process_bit(prev_timestamp, sync_mark ? SYNC : (prev_avg_avgs[1] > prev_avg_avgs[0] ? HIGH : LOW));
                 // Also we have to use the timestamp of the previous start of a 100ms window because we use averages
                 // from 1 and 2 windows ago:
                 //    ____     ________
@@ -704,7 +703,7 @@ void core1_main(void) {
                 //
                 // Where pt is `prev_timestamp', aa is `avg_avg', t is `timestamp', paa[1] is `prev_avg_avgs[1]' and
                 // paa[0] is `prev_avg_avgs[0]'.
-                prev_timestamp = timestamp;
+                prev_timestamp = timestamp + synced_timestamp_offset;
             }
         }
         // printf("%" PRIi32 ", %" PRIi32 "\n", start_100ms || end_200ms ? 0 : avg, prev_avg_avgs[1]);
