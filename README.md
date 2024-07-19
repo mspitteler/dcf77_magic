@@ -32,15 +32,16 @@ low enough that we don't get too much noise.
 
 ## Error resilience of the time decoder
 
-The carrier signal can still have a large amount of noise on it. This is why a matched filter is used to detect phase 
-of the (almost) periodic carrier. On top of this the time decoder is also made as robust as possible without having to 
-do smart tricks with what we know about time. The way it basically works now is that the BCD re-encoded/synthesized 
-bits of the RTC are compared to the BCD bits of the received time every minute and if a specific bit (let's say the 10s 
-bit of the minute for example) is wrong for more than 10 minutes, it is flipped (so we would flip the RTC from 10:20 
-to 10:30 in case of the example). This works surprisingly well (even for the fast changing minute bits) since the 
-bits are in BCD encoding. This algorithm works very close to a 50% bit error rate, (I haven't really done measurements 
-yet on how close we can get reliably) although in some cases (when it has a really bad error rate) it can take almost a 
-day to obtain the correct time, and probability of losing time at some point is high ofcourse.
+The demodulated signal (after envelope detection) can still have a large amount of noise on it. This is why a matched 
+filter is used to detect phase of the (almost) periodic demodulated signal. On top of this the time decoder is also 
+made as robust as possible without having to do smart tricks with what we know about time. The way it basically works 
+now is that the BCD re-encoded/synthesized bits of the RTC are compared to the BCD bits of the received time every 
+minute and if a specific bit (let's say the 10s bit of the minute for example) is wrong for more than 10 minutes, it is 
+flipped (so we would flip the RTC from 10:20 to 10:30 in case of the example). This works surprisingly well (even for 
+the fast changing minute bits) since the bits are in BCD encoding. This algorithm works very close to a 50% bit error 
+rate, (I haven't really done measurements yet on how close we can get reliably) although in some cases (when it has a 
+really bad error rate) it can take almost a day to obtain the correct time, and probability of losing time at some 
+point is high ofcourse.
 
 ## Usage
 
