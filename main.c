@@ -20,18 +20,15 @@
 #include "hardware/rtc.h"
 #include "pico/critical_section.h"
 
-#define CAPTURE_CHANNEL 0
+constexpr int CAPTURE_CHANNEL = 0;
 
-#define CAPTURE_DEPTH 20000
+constexpr int CAPTURE_DEPTH = 20000;
 // We hava a tolerance of 30ppm for the processor clock, so that means we will drift 30ppm * 300s = 9ms in 300s,
 // which is just a little under the sample time of the averages, which is good, because if the drift would be 
 // significantly higher we would lose in sharpness of the peak in the convolution output buffer.
-#define MATCHED_FILTER_N_SECONDS 300
+constexpr int MATCHED_FILTER_N_SECONDS = 300;
 
-#define SAMPLE_RATE 500'000l // Sample rate of the ADC when clkdiv is 0.
-// Number of average amplitudes per second after the filter. The average is taken over all 20000 samples, but upsampled
-// by a factor 4, so we get 100 amplitude averages per second.
-#define AVGS_PER_SECOND (SAMPLE_RATE / (N_ELEM(bpf_output_buf) / 4l))
+constexpr long SAMPLE_RATE = 500'000l; // Sample rate of the ADC when clkdiv is 0.
 
 // We don't want the type of N_ELEM to be size_t because that would cause every arithmetic expression that uses this
 // to turn unsigned.
@@ -101,10 +98,28 @@ struct set_cmp_rtc_data {
     bool min_parity_err, hour_parity_err, date_parity_err;
 };
 
+enum filter_sensitivity {
+    SENSITIVITY_LEVEL_0 = 5,
+    SENSITIVITY_LEVEL_1 = 4,
+    SENSITIVITY_LEVEL_2 = 3,
+    SENSITIVITY_LEVEL_3 = 2,
+    SENSITIVITY_LEVEL_4 = 1,
+    SENSITIVITY_LEVEL_5 = 0,
+    SENSITIVITY_LEVEL_6 = -1,
+    SENSITIVITY_LEVEL_7 = -2,
+    SENSITIVITY_LEVEL_8 = -3,
+    SENSITIVITY_LEVEL_9 = -4,
+};
+
+constexpr enum filter_sensitivity SENSITIVITY_LEVEL = SENSITIVITY_LEVEL_3;
+
 // Replace sample_buf[CAPTURE_DEPTH] with a ping and pong register
 static uint16_t sample_buf_ping[CAPTURE_DEPTH];
 static uint16_t sample_buf_pong[CAPTURE_DEPTH];
 static int16_t bpf_output_buf[CAPTURE_DEPTH];
+// Number of average amplitudes per second after the filter. The average is taken over all 20000 samples, but upsampled
+// by a factor 4, so we get 100 amplitude averages per second.
+constexpr long AVGS_PER_SECOND = (SAMPLE_RATE / (N_ELEM(bpf_output_buf) / 4l));
 static int16_t avg_buf[AVGS_PER_SECOND * MATCHED_FILTER_N_SECONDS] = {
     // Initialize all elements to -1, they should normally never have a negative value, so this is to detect 
     // which elements haven't been set yet.
@@ -158,7 +173,8 @@ void filter_biquad_IIR(const int16_t *const input, int16_t *const output, const 
         // Because we want such a high Q, we have to scale down w by 5 bits to prevent overflow. As it is now,
         // we stay well within about half of the range of a 32-bit integer. This does mean that the output is scaled
         // down by 5 bits as well (divide by 32), but the behaviour of the filter is not altered.
-        int32_t d0 = ((int32_t)input[i] - ((coeffs[3] * w[0] + coeffs[4] * w[1]) >> (14 - 5))) >> 5;
+        int32_t d0 = ((int32_t)input[i] - ((coeffs[3] * w[0] + coeffs[4] * w[1]) >> (14 - SENSITIVITY_LEVEL)));
+        d0 = SENSITIVITY_LEVEL >= 0 ? d0 >> SENSITIVITY_LEVEL : d0 << -SENSITIVITY_LEVEL;
         output[i] = (coeffs[0] * d0 + coeffs[1] * w[0] + coeffs[2] * w[1]) >> 14;
         w[1] = w[0];
         w[0] = d0;
