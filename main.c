@@ -96,6 +96,7 @@ struct set_cmp_rtc_data {
         };
     } bcd_date;
     bool min_parity_err, hour_parity_err, date_parity_err;
+    bool cest_not_cet, unsynced;
 };
 
 enum filter_sensitivity {
@@ -235,7 +236,11 @@ void rtc_alarm_handler() {
 
 int64_t set_rtc(alarm_id_t id, void *user_data) {
     struct set_cmp_rtc_data *data = user_data;
-    int flags = 0x01;
+    uint8_t flags = 0x00;
+    assign_bit(&flags, 0, data->cest_not_cet);
+    // assign_bit(&flags, 1, false); // Announce DST switch bit, not used in decoder.
+    assign_bit(&flags, 2, data->unsynced);
+    
     char s[] = "00-00-00-00-00-00-01-00\r";
     s[0] += data->bcd_date.year_hi, s[1] += data->bcd_date.year_lo, s[3] += data->bcd_date.month_hi;
     s[4] += data->bcd_date.month_lo, s[6] += data->bcd_date.day_hi, s[7] += data->bcd_date.day_lo;
@@ -294,6 +299,7 @@ bool is_valid_xor_mask(const uint8_t *const fields, const int idx, const uint8_t
 
 int64_t compare_time(alarm_id_t id, void *user_data) {
     static int field_diffs[6][8];
+    static bool prev_cest_not_cet = false;
     struct set_cmp_rtc_data *data = user_data;
     
     critical_section_enter_blocking(&last_rtc_alarm_crit_sec);
@@ -304,6 +310,15 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
     rtc_datetime.year -= 2000;
     if (rtc_datetime.dotw == 0)
         rtc_datetime.dotw = 7; // Sunday is 0 instead of 7 for the RTC.
+    if (prev_cest_not_cet != data->cest_not_cet)
+        rtc_datetime.hour += data->cest_not_cet ? 1 : -1; // We can safely assume the hour is not 23 or 00, so no carry.
+        // If the hour is 00 for some reason, it could become -01, and converting this to BCD will yield 15. This is 
+        // kind of weird, but if we had a DST switch at hour 00 something must have been very wrong with the time anyway 
+        // and it probably won't really matter that we set the hour to some bogus value.
+        // If the hour is 23 for some reason, it could become 24, and assuming we don't have any bit flips, this means
+        // that we will not actually set the time since 24 is an invalid hour. This is okay as we shouldn't have a DST
+        // switch at hour 23 anyway.
+    prev_cest_not_cet = data->cest_not_cet;
     union bcd_date rtc_bcd_date = {
         .min_lo = rtc_datetime.min % 10, .min_hi = rtc_datetime.min / 10,
         .hour_lo = rtc_datetime.hour % 10, .hour_hi = rtc_datetime.hour / 10,
@@ -350,6 +365,7 @@ int64_t compare_time(alarm_id_t id, void *user_data) {
     if (rtc_bcd_date.min != prev_rtc_bcd_date.min || rtc_bcd_date.hour != prev_rtc_bcd_date.hour ||
         rtc_bcd_date.day != prev_rtc_bcd_date.day || rtc_bcd_date.dotw != prev_rtc_bcd_date.dotw ||
         rtc_bcd_date.month != prev_rtc_bcd_date.month || rtc_bcd_date.year != prev_rtc_bcd_date.year) {
+        // TODO: set data->unsynced to true here and to false again if the RTC date hasn't changed for a while.
         printf("Changing RTC date!!!\n");
     }
     
@@ -366,7 +382,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     static bool minutes_parity_error = true, hours_parity_error = true, date_parity_error = true;
     static int bit = 0;
     
-    static int announce_dst_switch = 0, announce_leap_second = 0;
+    static int announce_dst_switch = 0, dst = 0, announce_leap_second = 0;
     // When more than half the bits in the last hour had the leap second announcement bit set, we can be fairly
     // certain that we have a leap second at the last second of the hour.
     
@@ -376,6 +392,8 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
     int seconds_in_minute = announce_leap_second > 30 && last_minute ? 61 : 60;
     if (bit >= seconds_in_minute)
         bit = 0;
+    if (do_dst_switch)
+        dst = -dst;
     
     if (bit_or_sync == SYNC) {
         // Don't get so high that it could take more than an hour to get back in sync
@@ -420,18 +438,20 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
             // Is 1 during the hour before switching.
             announce_dst_switch += (int)bit_value;
             break;
-        /**
-         * TODO: Do something with CEST and CET, so the RTC can switch cleanly between them without having to
-         * resynchronize, which could take a while if we have a lot of bit errors.
-         */
         case 17:
             // CEST (Central European Summer Time).
             cest = bit_value;
+            dst += (int)cest;
+            if (dst > 60) // Don't take more than an hour to switch if for some reason we had the wrong timezone.
+                dst = 60;
             break;
         case 18:
             // CET (Central European Time).
             cet = bit_value;
-            if (!(cest ^ cet))
+            dst -= (int)cet;
+            if (dst < -60) // Don't take more than an hour to switch if for some reason we had the wrong timezone.
+                dst = -60;
+            if (cest == cet)
                 printf("%" PRIu32 ": CEST and CET cannot have the same bit value\n", us_to_ms(timestamp));
             break;
         case 19:
@@ -538,7 +558,7 @@ void process_bit(uint64_t timestamp, enum bit_value_or_sync bit_or_sync) {
         static struct set_cmp_rtc_data data;
         data = (struct set_cmp_rtc_data) {
             .timestamp = timestamp + 3'000'000ull, .bcd_date = date, .min_parity_err = minutes_parity_error,
-            .hour_parity_err = hours_parity_error, .date_parity_err = date_parity_error
+            .hour_parity_err = hours_parity_error, .date_parity_err = date_parity_error, .cest_not_cet = dst > 0
         };
         if (add_alarm_at(from_us_since_boot(data.timestamp), &set_rtc, &data, true) < 0 ||
             add_alarm_at(from_us_since_boot(data.timestamp - 500'000ull), &compare_time, &data, true) < 0)
